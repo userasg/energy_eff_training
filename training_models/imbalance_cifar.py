@@ -3,6 +3,8 @@ import torchvision
 import torchvision.transforms as transforms
 import numpy as np
 
+#this is to experiment and deal with the imbalanced cifar10 and 100 data sets 
+#just roll with it
 class IMBALANCECIFAR10(torchvision.datasets.CIFAR10):
     cls_num = 10
 

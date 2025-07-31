@@ -21,6 +21,7 @@ Reference:
 If you use this implementation in you work, please don't forget to mention the
 author, Yerlan Idelbayev.
 '''
+#this is a custom built resnet model for the cifar imbalanced data sets im not sure where its used icl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

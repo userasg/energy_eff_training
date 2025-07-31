@@ -11,7 +11,7 @@ from tqdm import tqdm
 from imbalance_cifar import IMBALANCECIFAR100
 
 # cls_num_list = IMBALANCECIFAR100.get_cls_num_list()
-
+#more imbalance tests 
 class LDAMLoss(nn.Module):
     
     def __init__(self, cls_num_list, max_m=0.5, weight=None, s=30):

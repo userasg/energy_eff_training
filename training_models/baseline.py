@@ -6,6 +6,8 @@ import time
 from utils import log_memory, plot_metrics, plot_metrics_test, plot_accuracy_time_multi, plot_accuracy_time_multi_test
 from tqdm import tqdm
 
+#this is a baseline training loop used in the paper as a comparison 
+#Remember its not really about building the model the PDD works at the data layer and is about the dropout strategy used 
 
 def train_baseline(model_name, model, train_loader, test_loader, device, epochs, save_path):
     model.to(device)
@@ -14,8 +16,10 @@ def train_baseline(model_name, model, train_loader, test_loader, device, epochs,
     # optimizer = optim.SGD(model.parameters(), lr=0.1, momentum=0.9, weight_decay=0.0001)
     
     # scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=2, verbose=True)
+    #all model hyperparams 
     optimizer = optim.AdamW(model.parameters(), lr=3e-4)
     scheduler = StepLR(optimizer, step_size=1, gamma=0.98)
+    #records metrics
     epoch_losses = []
     epoch_accuracies = []
     epoch_test_accuracies = []
@@ -24,8 +28,9 @@ def train_baseline(model_name, model, train_loader, test_loader, device, epochs,
     start_time = time.time()
     num_step = 0
     samples_used_per_epoch = []
-
+    #start of the training loop 
     for epoch in range(epochs):
+        #records samples
         samples_used = 0
         model.train()
         epoch_start_time = time.time()
@@ -36,7 +41,7 @@ def train_baseline(model_name, model, train_loader, test_loader, device, epochs,
         print(f"Epoch [{epoch+1/epochs}]")
         progress_bar = tqdm(enumerate(train_loader), total=len(train_loader), desc="Training")
 
-
+        #blah blah blah main loop shit similar to diss 
         for batch_idx, (inputs, labels) in progress_bar:
             inputs, labels = inputs.to(device), labels.to(device)
 
@@ -55,7 +60,8 @@ def train_baseline(model_name, model, train_loader, test_loader, device, epochs,
             preds = torch.argmax(outputs, dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
-
+        
+        #record
         epoch_loss = running_loss / len(train_loader)
         epoch_accuracy = correct / total
         epoch_losses.append(epoch_loss)
@@ -65,7 +71,7 @@ def train_baseline(model_name, model, train_loader, test_loader, device, epochs,
         time_per_epoch.append(epoch_end_time - epoch_start_time)
 
         print(f"Epoch [{epoch+1}/{epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
-
+        #eval mode
         model.eval()
         test_correct = 0
         test_total = 0
@@ -87,7 +93,7 @@ def train_baseline(model_name, model, train_loader, test_loader, device, epochs,
         scheduler.step(val_loss)
         epoch_test_accuracies.append(accuracy)
         epoch_test_losses.append(val_loss)
-
+    #near done
     end_time = time.time()
     samples_used_per_epoch.append(samples_used)
     log_memory(start_time, end_time)

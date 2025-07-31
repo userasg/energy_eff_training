@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import math
 
-
+#diddy kong
+#collection of smaller model blocks etc
 class BasicBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1, downsample=None):
         super(BasicBlock, self).__init__()

@@ -8,7 +8,7 @@ from tqdm import tqdm
 import json
 import os
 import numpy as np
-
+#mathclass
 class TrainRevision:
     def __init__(self, model_name, model, train_loader, test_loader, device, epochs, save_path, threshold):
         self.model_name = model_name
@@ -19,8 +19,9 @@ class TrainRevision:
         self.epochs = epochs
         self.save_path = save_path
         self.threshold = threshold
-
+    #train hard samples only 
     def train_selective(self):
+        #all setup
         self.model.to(self.device)
         save_path = self.save_path
         criterion = nn.CrossEntropyLoss()
@@ -33,6 +34,8 @@ class TrainRevision:
         epoch_test_losses = []
         time_per_epoch = []
         start_time = time.time()
+        #train loop starts puts into training mode 
+        #REM: EPOCH is whole training cycle forward and back
         for epoch in range(self.epochs):
             self.model.train()
             epoch_start_time = time.time()
@@ -43,14 +46,16 @@ class TrainRevision:
             total = 0
             print(f"Epoch [{epoch+1/self.epochs}]")
             progress_bar = tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc="Training")
-
+            #batch is batch processing
             for batch_idx, (inputs, labels) in progress_bar:
+                #inputs and true labels
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 
                 with torch.no_grad():
+                    #outputs and predictions
                     outputs = self.model(inputs)
                     preds = torch.argmax(outputs, dim=1)
-                    
+                    #if threshold == 0 then only keep missclassified
                     if self.threshold == 0:
                         mask = preds != labels
                     else:
@@ -60,7 +65,7 @@ class TrainRevision:
 
                 if not mask.any():
                     continue
-
+                #extract hard examples 
                 inputs_misclassified = inputs[mask]
                 labels_misclassified = labels[mask]
 
@@ -75,7 +80,7 @@ class TrainRevision:
 
                 #     inputs_misclassified = torch.cat((inputs_misclassified, correct_inputs), dim=0)
                 #     labels_misclassified = torch.cat((labels_misclassified, correct_labels), dim=0)
-
+                #math shit 
                 optimizer.zero_grad()
 
                 outputs_misclassified = self.model(inputs_misclassified)
@@ -150,7 +155,7 @@ class TrainRevision:
         )
 
         return self.model
-
+    #gradullay reintroduces easier examples 
     def train_selective_epoch(self):
         self.model.to(self.device)
         save_path = self.save_path
@@ -178,7 +183,7 @@ class TrainRevision:
 
             for batch_idx, (inputs, labels) in progress_bar:
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
-
+                #neater way of doing stuff in same loop
                 if epoch < self.epochs:
                     with torch.no_grad():
                         outputs = self.model(inputs)
@@ -195,7 +200,7 @@ class TrainRevision:
 
                     accumulated_inputs.append(inputs[mask_correct].cpu())
                     accumulated_labels.append(labels[mask_correct].cpu())
-
+                    #reintroude easier samples
                     if len(accumulated_inputs) >= max_accumulated_samples:
                         reintroduced_inputs = torch.cat(accumulated_inputs, dim=0).to(self.device)
                         reintroduced_labels = torch.cat(accumulated_labels, dim=0).to(self.device)
@@ -294,7 +299,7 @@ class TrainRevision:
         num_step = 0
         samples_used_per_epoch = []
         for epoch in range(self.epochs):
-            samples_used = 0
+            samples_used = 0 
             if epoch < start_revision : 
                 self.model.train()
                 epoch_start_time = time.time()
