@@ -277,7 +277,6 @@ class TrainRevision:
 
         return self.model
 
-
     def train_with_revision(self, start_revision, task):
 
         save_path = self.save_path
@@ -469,7 +468,6 @@ class TrainRevision:
 
         return self.model, num_step
     
-
     def train_with_random(self, start_revision, task):
 
         save_path = self.save_path
@@ -866,7 +864,6 @@ class TrainRevision:
 
         return self.model, num_step
     
-
     def train_with_percentage(self, start_revision):
         save_path = self.save_path
         self.model.to(self.device)
@@ -1001,6 +998,8 @@ class TrainRevision:
 
         return self.model, num_step
 
+    #math function based droput schedules
+    #inverse linear -> f(x,a) = 1/x+a
     def inverse_linear(self, epoch, alpha):
         if epoch == 200:
             return 50000
@@ -1147,6 +1146,7 @@ class TrainRevision:
 
         return self.model, num_step
     
+    #logarithmic decay -> f(x,a) = 1/log(x+a)
     def log_schedule(self, epoch, data_size, alpha):
         x = np.arange(1, 200)
         y = 1 / np.log(x + alpha)  # make sure alpha > 1 to avoid log(0)
@@ -1290,3 +1290,24 @@ class TrainRevision:
         )
 
         return self.model, num_step 
+    
+    # power law decay -> f(x,a) = 1/x^a
+    def power_law_decay(self, epoch, data_size, alpha):
+        x = np.arange(1, self.epochs + 1)
+        y = 1 / (x ** alpha)
+        y_scaled = (y / np.max(y)) * data_size
+        return y_scaled[epoch - 1]
+
+    # exponential decay -> f(x,a) = e^{-ax}
+    def exponential_decay(self, epoch, data_size, alpha):
+        x = np.arange(1, self.epochs + 1)
+        y = np.exp(-alpha * x)
+        y_scaled = (y / np.max(y)) * data_size
+        return y_scaled[epoch - 1]
+
+    # sigmoid complement decay -> f(x,a) = 1 - 1 / (1 + e^{-ax})
+    def sigmoid_complement_decay(self, epoch, data_size, alpha):
+        x = np.arange(1, self.epochs + 1)
+        y = 1 - 1 / (1 + np.exp(-alpha * x))
+        y_scaled = (y / np.max(y)) * data_size
+        return y_scaled[epoch - 1]
