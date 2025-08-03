@@ -11,7 +11,10 @@ from longtail_train import train_baseline_longtail, train_with_revision_longtail
 
 def main():
     parser = argparse.ArgumentParser(description="Train ResNet on CIFAR-100")
-    parser.add_argument("--mode", type=str, choices=["baseline", "selective_gradient", "selective_epoch", "train_with_revision", "train_with_samples", "train_with_revision_3d", "train_with_random", "train_with_inv_lin", "train_with_log", "train_with_percentage", "train_with_power_law"], required=True,
+    parser.add_argument("--mode", type=str, choices=[
+    "baseline", "selective_gradient", "selective_epoch", "train_with_revision", "train_with_samples",
+    "train_with_revision_3d", "train_with_random", "train_with_inv_lin", "train_with_log", 
+    "train_with_percentage", "train_with_power_law", "train_with_exponential", "train_with_sigmoid_complement"], required=True,
                         help="Choose training mode: 'baseline' or 'selective_gradient'")
     parser.add_argument("--epoch", type=int, required=False, default=10,
                         help="Number of epochs to train for")
@@ -32,6 +35,14 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    print(torch.version.cuda)
+    if device.type == "cuda":
+        print(f"CUDA available: {torch.cuda.is_available()}, Device Name: {torch.cuda.get_device_name(0)}")
+    else:
+        print("⚠️ CUDA not available. Using CPU.")
+
+
     pretrained = False
     if args.dataset == "mnist":
         num_classes = 10
@@ -173,6 +184,17 @@ def main():
             print(f"Training {args.mode}, will start revision after {args.start_revision}")
             trained_model, num_step = train_revision.train_with_power_law(args.start_revision, data_size)
             print("Number of steps : ", num_step)
+        elif args.mode == "train_with_exponential":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print(f"Training {args.mode}, will start revision after {args.start_revision}")
+            trained_model, num_step = train_revision.train_with_exponential(args.start_revision, data_size)
+            print("Number of steps : ", num_step)
+        elif args.mode == "train_with_sigmoid_complement":
+            train_revision = TrainRevision(args.model, model, train_loader, test_loader, device, args.epoch, args.save_path, args.threshold)
+            print(f"Training {args.mode}, will start revision after {args.start_revision}")
+            trained_model, num_step = train_revision.train_with_sigmoid_complement(args.start_revision, data_size)
+            print("Number of steps : ", num_step)
+
     
     eff_epoch = int(num_step/data_size)
 
