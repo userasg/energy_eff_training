@@ -6,4 +6,14 @@
 
 source /usr2/share/gpu.sbatch
 
-python ./main.py --model mobilenet_v2 --mode train_with_revision --epoch 10 --save_path cifar10_results/mobilenet_v2 --dataset cifar10 --batch_size 32 --start_revision 9 --task classification --threshold 0.3
+python ./main.py \
+  --model mobilenet_v2 \
+  --mode train_with_switching \
+  --epoch 50 \
+  --save_path cifar10_results/mobilenet_v2 \
+  --dataset cifar10 \
+  --batch_size 32 \
+  --start_revision 0 \
+  --task classification \
+  --threshold 0.3 \
+  --seed 42
