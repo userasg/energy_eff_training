@@ -7,14 +7,15 @@ from baseline import train_baseline
 from selective_gradient import TrainRevision
 from test import test_model
 from longtail_train import train_baseline_longtail, train_with_revision_longtail
-
+from SimpleSwitcher import SimpleSwitcher
 
 def main():
     parser = argparse.ArgumentParser(description="Train ResNet on CIFAR-100")
     parser.add_argument("--mode", type=str, choices=[
     "baseline", "selective_gradient", "selective_epoch", "train_with_revision", "train_with_samples",
     "train_with_revision_3d", "train_with_random", "train_with_inv_lin", "train_with_log", 
-    "train_with_percentage", "train_with_power_law", "train_with_exponential", "train_with_sigmoid_complement"], required=True,
+    "train_with_percentage", "train_with_power_law", "train_with_exponential", "train_with_sigmoid_complement", 
+    "train_with_switching"], required=True,
                         help="Choose training mode: 'baseline' or 'selective_gradient'")
     parser.add_argument("--epoch", type=int, required=False, default=10,
                         help="Number of epochs to train for")
@@ -32,6 +33,7 @@ def main():
     parser.add_argument("--start_revision", type=int, help="Start revision after the given epoch")
     parser.add_argument("--long_tail", action="store_true", help="LongTail CIFAR100 or native version")
     parser.add_argument("--ldam", action="store_true", help="Use LDAM-DRW method for long tail classification")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility (used by SimpleSwitcher)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -47,6 +49,7 @@ def main():
     if args.dataset == "mnist":
         num_classes = 10
         train_loader, test_loader = load_mnist()
+        data_size = len(train_loader.dataset) 
     elif args.dataset == "cifar":
         if args.batch_size:
             train_loader, test_loader, cls_num_list, data_size = load_cifar100(args.long_tail, args.batch_size)
@@ -194,6 +197,25 @@ def main():
             print(f"Training {args.mode}, will start revision after {args.start_revision}")
             trained_model, num_step = train_revision.train_with_sigmoid_complement(args.start_revision, data_size)
             print("Number of steps : ", num_step)
+        elif args.mode == "train_with_switching":
+            train_switcher = SimpleSwitcher(
+                args.model,
+                model,
+                train_loader,
+                test_loader,
+                device,
+                args.epoch,
+                args.save_path,
+                args.threshold,
+                data_size,
+                start_revision=args.start_revision if args.start_revision else 0,
+                seed=args.seed  
+            )
+            print(f"Training with dynamic switching scheduler heheheh......")
+            trained_model, num_step = train_switcher.train_with_switching()
+            print("Number of steps : ", num_step)
+
+
 
     
     eff_epoch = int(num_step/data_size)

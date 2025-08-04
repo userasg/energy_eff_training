@@ -1000,13 +1000,14 @@ class TrainRevision:
 
     #math function based droput schedules
     #inverse linear -> f(x,a) = 1/x+a
-    def inverse_linear(self, epoch, alpha):
-        if epoch == 200:
-            return 50000
-        x = np.arange(1, 200)
+    def inverse_linear(self, epoch, data_size, alpha):
+        if epoch == self.epochs:
+            return data_size
+        x = np.arange(1, self.epochs + 1)
         y = 1 / (x + alpha)
-        y_scaled = (y / np.max(y)) * 50000
+        y_scaled = (y / np.max(y)) * data_size
         return y_scaled[epoch - 1]
+
 
     def train_with_inverse_linear(self, start_revision, data_size):
         save_path = self.save_path
@@ -1041,7 +1042,7 @@ class TrainRevision:
 
             if epoch < start_revision:
                 # Use inverse linear decay
-                scaled_value = self.inverse_linear(epoch + 1, alpha)  # epoch+1 to match 1-based indexing
+                scaled_value = self.inverse_linear(epoch + 1, data_size, alpha)
                 sample_ratio = scaled_value / data_size
 
                 for batch_idx, (inputs, labels) in progress_bar:
