@@ -8,8 +8,8 @@ source /usr2/share/gpu.sbatch
 
 python ./main.py \
   --model mobilenet_v2 \
-  --mode train_with_switching \
-  --epoch 50 \
+  --mode train_with_genetic \
+  --epoch 100 \
   --save_path cifar10_results/mobilenet_v2 \
   --dataset cifar10 \
   --batch_size 32 \

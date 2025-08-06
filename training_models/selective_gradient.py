@@ -110,7 +110,8 @@ class TrainRevision:
             epoch_end_time = time.time()
             time_per_epoch.append(epoch_end_time-epoch_start_time)
 
-            print(f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
+            print(f"[Epoch {epoch+1}/{self.epochs}] Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_accuracy:.4f} | Test Loss: {val_loss:.4f}, Test Acc: {accuracy:.4f}")
+
 
             self.model.eval()
             correct = 0

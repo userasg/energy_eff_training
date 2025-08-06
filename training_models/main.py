@@ -8,6 +8,8 @@ from selective_gradient import TrainRevision
 from test import test_model
 from longtail_train import train_baseline_longtail, train_with_revision_longtail
 from SimpleSwitcher import SimpleSwitcher
+from GeneticRevision import GeneticRevision
+
 
 def main():
     parser = argparse.ArgumentParser(description="Train ResNet on CIFAR-100")
@@ -15,7 +17,7 @@ def main():
     "baseline", "selective_gradient", "selective_epoch", "train_with_revision", "train_with_samples",
     "train_with_revision_3d", "train_with_random", "train_with_inv_lin", "train_with_log", 
     "train_with_percentage", "train_with_power_law", "train_with_exponential", "train_with_sigmoid_complement", 
-    "train_with_switching"], required=True,
+    "train_with_switching", "train_with_genetic"], required=True,
                         help="Choose training mode: 'baseline' or 'selective_gradient'")
     parser.add_argument("--epoch", type=int, required=False, default=10,
                         help="Number of epochs to train for")
@@ -214,6 +216,22 @@ def main():
             print(f"Training with dynamic switching scheduler heheheh......")
             trained_model, num_step = train_switcher.train_with_switching()
             print("Number of steps : ", num_step)
+        elif args.mode == "train_with_genetic":
+            print(f"Training with GA-driven dropout schedules…")
+            ga = GeneticRevision(
+                args.model,          # model name
+                model,               # your PyTorch model
+                train_loader,
+                test_loader,
+                device,
+                args.epoch,
+                args.save_path,
+                args.threshold,
+                seed=args.seed
+            )
+            trained_model, num_step = ga.train_with_genetic()
+            print("Number of steps:", num_step)
+
 
 
 
