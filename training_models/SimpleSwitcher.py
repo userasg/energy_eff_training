@@ -105,9 +105,6 @@ class SimpleSwitcher(TrainRevision):
             epoch_accuracies.append(epoch_accuracy)
             epoch_end_time = time.time()
             time_per_epoch.append(epoch_end_time - epoch_start_time)
-
-            print(f"Epoch [{epoch+1}/{self.epochs}], Loss: {epoch_loss:.4f}, Accuracy: {epoch_accuracy:.4f}")
-
             # Evaluate
             self.model.eval()
             correct, total, test_loss = 0, 0, 0.0
@@ -123,7 +120,7 @@ class SimpleSwitcher(TrainRevision):
 
             accuracy = correct / total
             val_loss = test_loss / len(self.test_loader)
-            print(f"Test Accuracy: {accuracy:.4f}, Test Loss: {val_loss:.4f}")
+            print(f"[Epoch {epoch+1}/{self.epochs}] Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_accuracy:.4f} | Test Loss: {val_loss:.4f}, Test Acc: {accuracy:.4f}")
             scheduler.step(val_loss)
             epoch_test_accuracies.append(accuracy)
             epoch_test_losses.append(val_loss)

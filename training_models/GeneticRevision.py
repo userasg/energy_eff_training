@@ -1,136 +1,188 @@
+import random
+import uuid
+import time
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.optim.lr_scheduler import StepLR
 import numpy as np
-import time
 from tqdm import tqdm
+from torch.optim.lr_scheduler import StepLR
+from torch import optim
+from selective_gradient import TrainRevision
 from utils import log_memory, plot_accuracy_time_multi, plot_accuracy_time_multi_test
-from selective_gradient import TrainRevision  # Inherit from this
 
 
 class GeneticRevision(TrainRevision):
-    def __init__(self, model_name, model, train_loader, test_loader, device, epochs, save_path, threshold, population_size=10):
+    def __init__(self, model_name, model, train_loader, test_loader, device, epochs, save_path,
+                 threshold, seed=42):
         super().__init__(model_name, model, train_loader, test_loader, device, epochs, save_path, threshold)
-        self.population_size = population_size
-        self.population = self.initialize_population()
+        self.seed = seed
+        self.rng = random.Random(seed)
+        # one chromosome per batch
+        self.population_size = len(train_loader)
+        # available schedule types (must match TrainRevision methods)
+        self.schedules = [
+            'power', 'exponential', 'logarithmic', 'inverse_linear', 'sigmoid_complement'
+        ]
+        # initialize population and history of batch assignments
+        self._init_population()
+        self.uid_history = {chrom['uid']: [] for chrom in self.population}
 
-    def initialize_population(self):
-        population = []
+    def _init_population(self):
+        """Populate initial chromosomes with unique UID, random schedule and alpha."""
+        self.population = []
         for _ in range(self.population_size):
-            genome = {
-                'decay_type': np.random.choice(['power', 'exp', 'log', 'inv_lin', 'sigmoid']),
-                'alpha': np.random.uniform(0.1, 3.0)
-            }
-            population.append(genome)
-        return population
+            uid = uuid.uuid4().hex
+            schedule = self.rng.choice(self.schedules)
+            alpha = round(self.rng.uniform(0.1, 3.0), 2)
+            self.population.append({'uid': uid, 'schedule': schedule, 'alpha': alpha})
 
-    def evaluate_fitness(self, genome, data_size, start_revision):
-        decay_type = genome['decay_type']
-        alpha = genome['alpha']
+    def _shuffle_population(self):
+        """Shuffle chromosome-to-batch mapping, avoiding assignment to recent batches."""
+        indices = list(range(self.population_size))
+        # retry until no chromosome is placed in its last 5 batch slots
+        while True:
+            perm = self.rng.sample(indices, k=self.population_size)
+            if all(
+                batch_idx not in self.uid_history[self.population[chrom_idx]['uid']]
+                for batch_idx, chrom_idx in enumerate(perm)
+            ):
+                break
+        # record new history and store shuffled mapping
+        for batch_idx, chrom_idx in enumerate(perm):
+            uid = self.population[chrom_idx]['uid']
+            history = self.uid_history.setdefault(uid, [])
+            history.append(batch_idx)
+            if len(history) > 5:
+                history.pop(0)
+        self.shuffled_indices = perm
 
+    def _apply_dropout_schedule(self, inputs, labels, chrom, epoch):
+        """Select subset of samples according to schedule function from TrainRevision."""
+        batch_size = inputs.size(0)
+        # determine number of samples to keep based on schedule
+        alpha = chrom['alpha']
+        step = epoch + 1  # TrainRevision schedules are 1-based
+        schedule = chrom['schedule']
+        if schedule == 'power':
+            keep = self.power_law_decay(step, batch_size, alpha)
+        elif schedule == 'exponential':
+            keep = self.exponential_decay(step, batch_size, alpha)
+        elif schedule == 'logarithmic':
+            keep = self.log_schedule(step, batch_size, alpha)
+        elif schedule == 'inverse_linear':
+            keep = self.inverse_linear(step, batch_size, alpha)
+        elif schedule == 'sigmoid_complement':
+            keep = self.sigmoid_complement_decay(step, batch_size, alpha)
+        else:
+            keep = batch_size
+        # clamp and convert to int
+        k = max(1, min(batch_size, int(keep)))
+        # randomly sample k examples
+        perm = torch.randperm(batch_size, device=inputs.device)
+        idx = perm[:k]
+        return inputs[idx], labels[idx]
+
+    def _evolve_population(self, fitness):
+        """Select elites and replace the rest with new random chromosomes."""
+        # sort by loss (lower is better)
+        sorted_pop = sorted(self.population, key=lambda c: fitness.get(c['uid'], float('inf')))
+        num_elite = self.population_size // 2
+        elites = sorted_pop[:num_elite]
+        new_pop = elites.copy()
+        # generate fresh chromosomes for bottom half
+        for _ in range(self.population_size - num_elite):
+            uid = uuid.uuid4().hex
+            schedule = self.rng.choice(self.schedules)
+            alpha = round(self.rng.uniform(0.1, 3.0), 2)
+            new_pop.append({'uid': uid, 'schedule': schedule, 'alpha': alpha})
+            self.uid_history[uid] = []
+        self.population = new_pop
+
+    def train_with_genetic(self):
+        """Main training loop that applies GA-evolved dropout schedules per batch."""
+        self.model.to(self.device)
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.AdamW(self.model.parameters(), lr=3e-4)
         scheduler = StepLR(optimizer, step_size=1, gamma=0.98)
 
-        self.model.train()
-        total_correct = 0
-        total_samples = 0
-        total_loss = 0.0
+        epoch_accuracies, epoch_losses = [], []
+        epoch_test_accuracies, epoch_test_losses = [], []
+        time_per_epoch, samples_per_epoch = [], []
+        num_steps = 0
+        start_time = time.time()
 
         for epoch in range(self.epochs):
-            sample_ratio = self.compute_schedule(epoch + 1, data_size, alpha, decay_type) / data_size
-            sample_ratio = min(1.0, sample_ratio)
+            # remap chromosomes to batches
+            self._shuffle_population()
 
-            for inputs, labels in self.train_loader:
-                inputs, labels = inputs.to(self.device), labels.to(self.device)
-                batch_size = inputs.size(0)
-                selected_count = max(1, int(sample_ratio * batch_size))
+            # -- training --
+            self.model.train()
+            running_loss, correct, total = 0.0, 0, 0
+            fitness = {}
+            for batch_idx, (x, y) in enumerate(tqdm(self.train_loader, desc=f"Genetic Epoch {epoch+1}")):
+                chrom = self.population[self.shuffled_indices[batch_idx]]
+                inputs, labels = x.to(self.device), y.to(self.device)
+                inputs_sel, labels_sel = self._apply_dropout_schedule(inputs, labels, chrom, epoch)
 
-                indices = torch.randperm(batch_size)[:selected_count]
-                inputs_selected = inputs[indices]
-                labels_selected = labels[indices]
+                outputs = self.model(inputs_sel)
+                loss = criterion(outputs, labels_sel)
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
 
-                optimizer.zero_grad()
-                outputs = self.model(inputs_selected)
-                loss = criterion(outputs, labels_selected)
-                loss.backward()
-                optimizer.step()
+                running_loss += loss.item()
+                preds = outputs.argmax(dim=1)
+                correct += (preds == labels_sel).sum().item()
+                total += labels_sel.size(0)
+                fitness[chrom['uid']] = loss.item()
+                num_steps += labels_sel.size(0)
 
-                total_loss += loss.item()
+            # record per-epoch stats
+            epoch_losses.append(running_loss / len(self.train_loader))
+            epoch_accuracies.append(correct / total if total else 0)
+            time_per_epoch.append(time.time() - start_time)
+            samples_per_epoch.append(num_steps)
 
-                with torch.no_grad():
-                    preds = torch.argmax(self.model(inputs), dim=1)
-                    total_correct += (preds == labels).sum().item()
-                    total_samples += labels.size(0)
+            # -- evaluation --
+            self.model.eval()
+            test_loss, test_correct, test_total = 0.0, 0, 0
+            with torch.no_grad():
+                for x, y in self.test_loader:
+                    x, y = x.to(self.device), y.to(self.device)
+                    out = self.model(x)
+                    tl = criterion(out, y)
+                    test_loss += tl.item()
+                    preds = out.argmax(dim=1)
+                    test_correct += (preds == y).sum().item()
+                    test_total += y.size(0)
 
-        accuracy = total_correct / total_samples
-        return accuracy  # Can also combine with -total_loss for multi-objective
+            epoch_test_losses.append(test_loss / len(self.test_loader))
+            epoch_test_accuracies.append(test_correct / test_total)
 
-    def compute_schedule(self, epoch, data_size, alpha, decay_type):
-        if decay_type == 'power':
-            return self.power_law_decay(epoch, data_size, alpha)
-        elif decay_type == 'exp':
-            return self.exponential_decay(epoch, data_size, alpha)
-        elif decay_type == 'log':
-            return self.log_schedule(epoch, data_size, alpha)
-        elif decay_type == 'inv_lin':
-            return self.inverse_linear(epoch, alpha)
-        elif decay_type == 'sigmoid':
-            return self.sigmoid_complement_decay(epoch, data_size, alpha)
+            print(f"Epoch {epoch+1}/{self.epochs} | "
+                  f"Loss {epoch_losses[-1]:.4f} Acc {epoch_accuracies[-1]:.4f} | "
+                  f"Test Loss {epoch_test_losses[-1]:.4f} Acc {epoch_test_accuracies[-1]:.4f}")
+            scheduler.step(epoch_test_losses[-1])
 
-    def evolve_population(self, data_size, start_revision):
-        fitness_scores = [self.evaluate_fitness(g, data_size, start_revision) for g in self.population]
-        sorted_idx = np.argsort(fitness_scores)[::-1]
-        top_genomes = [self.population[i] for i in sorted_idx[:self.population_size // 2]]
+            # GA evolution
+            self._evolve_population(fitness)
 
-        new_population = top_genomes.copy()
-        while len(new_population) < self.population_size:
-            parent1, parent2 = np.random.choice(top_genomes, 2, replace=False)
-            child = {
-                'decay_type': np.random.choice([parent1['decay_type'], parent2['decay_type']]),
-                'alpha': np.clip(np.mean([parent1['alpha'], parent2['alpha']]) + np.random.normal(0, 0.1), 0.1, 3.0)
-            }
-            new_population.append(child)
+        # logging and plotting
+        log_memory(start_time, time.time())
+        plot_accuracy_time_multi(
+            self.model_name + "_genetic",
+            epoch_accuracies,
+            time_per_epoch,
+            self.save_path,
+            self.save_path
+        )
+        plot_accuracy_time_multi_test(
+            # now passing samples_per_epoch and threshold correctly:
+            self.model_name + "_genetic",
+            epoch_test_accuracies,
+            time_per_epoch,
+            samples_per_epoch,
+            self.threshold,
+            self.save_path,
+            self.save_path
+        )
 
-        self.population = new_population
-
-    def train_genetic_scheduler(self, generations, data_size, start_revision):
-        for gen in range(generations):
-            print(f"\nGeneration {gen+1}/{generations}")
-            self.evolve_population(data_size, start_revision)
-            best_genome = max(self.population, key=lambda g: self.evaluate_fitness(g, data_size, start_revision))
-            print(f"Best Genome: {best_genome}")
-
-        return best_genome  # Can be used in final training phase
-
-    #### Dropout schedule math functions inherited ####
-    def inverse_linear(self, epoch, alpha):
-        x = np.arange(1, 200)
-        y = 1 / (x + alpha)
-        y_scaled = (y / np.max(y)) * 50000
-        return y_scaled[epoch - 1]
-
-    def log_schedule(self, epoch, data_size, alpha):
-        x = np.arange(1, 200)
-        y = 1 / np.log(x + alpha)
-        y_scaled = (y / np.max(y)) * data_size
-        return y_scaled[epoch - 1]
-
-    def power_law_decay(self, epoch, data_size, alpha):
-        x = np.arange(1, self.epochs + 1)
-        y = 1 / (x ** alpha)
-        y_scaled = (y / np.max(y)) * data_size
-        return y_scaled[epoch - 1]
-
-    def exponential_decay(self, epoch, data_size, alpha):
-        x = np.arange(1, self.epochs + 1)
-        y = np.exp(-alpha * x)
-        y_scaled = (y / np.max(y)) * data_size
-        return y_scaled[epoch - 1]
-
-    def sigmoid_complement_decay(self, epoch, data_size, alpha):
-        x = np.arange(1, self.epochs + 1)
-        y = 1 - 1 / (1 + np.exp(-alpha * x))
-        y_scaled = (y / np.max(y)) * data_size
-        return y_scaled[epoch - 1]
+        return self.model, num_steps
