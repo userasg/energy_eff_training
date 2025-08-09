@@ -9,7 +9,7 @@ source /usr2/share/gpu.sbatch
 python ./main.py \
   --model mobilenet_v2 \
   --mode train_with_genetic \
-  --epoch 10 \
+  --epoch 30 \
   --save_path cifar10_results/mobilenet_v2 \
   --dataset cifar10 \
   --batch_size 32 \
