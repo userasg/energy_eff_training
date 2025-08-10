@@ -10,20 +10,15 @@ from torch.optim.lr_scheduler import StepLR
 from torch import optim
 from selective_gradient import TrainRevision
 from utils import log_memory, plot_accuracy_time_multi, plot_accuracy_time_multi_test
-
-# Hyperparameters for GA and annealing (unchanged)
-MAX_ALPHA            = 10.0
-MAX_BETA             = 10.0
-INIT_ELITISM         = 0.2
-FINAL_ELITISM        = 0.8
-INIT_MUTATION_RATE   = 0.4
-FINAL_MUTATION_RATE  = 0.05
-MUTATION_STD         = 0.1
-PENALTY_COEFF        = 1.0  # λ in fitness = loss + λ*(kept/original)
-
-# Fixed, simple quantization to allow real homogeneity and curve caching
-_GRID_STEP = 0.5   # snap α, β to multiples of 0.5
-
+MAX_ALPHA            = 6.0
+MAX_BETA             = 8.0
+INIT_ELITISM         = 0.10
+FINAL_ELITISM        = 0.99
+INIT_MUTATION_RATE   = 0.55
+FINAL_MUTATION_RATE  = 0.03
+MUTATION_STD         = 0.20
+PENALTY_COEFF        = 0.55   
+_GRID_STEP = 0.5
 class GeneticRevision(TrainRevision):
     def __init__(self, model_name, model, train_loader, test_loader,
                  device, epochs, save_path, threshold, seed=42,
@@ -35,7 +30,7 @@ class GeneticRevision(TrainRevision):
                          device, epochs, save_path, threshold)
         self.rng  = random.Random(seed)
         nbatches  = len(train_loader)
-        self.population_size = min(128, nbatches) if pop_size is None else min(pop_size, nbatches)
+        self.population_size = min(64, nbatches) if pop_size is None else min(pop_size, nbatches)
         self.schedules = ['power','exponential','logarithmic','inverse_linear','sigmoid_complement']
         self._x = np.arange(1, self.epochs + 1, dtype=np.float32)
 
