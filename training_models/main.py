@@ -219,8 +219,8 @@ def main():
         elif args.mode == "train_with_genetic":
             print(f"Training with GA-driven dropout schedules…")
             ga = GeneticRevision(
-                args.model,          # model name
-                model,               # your PyTorch model
+                args.model,         
+                model,             
                 train_loader,
                 test_loader,
                 device,
