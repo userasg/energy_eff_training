@@ -16,4 +16,4 @@ python ./main.py \
   --start_revision 0 \
   --task classification \
   --threshold 0.3 \
-  --seed 42
+  --seed 123
