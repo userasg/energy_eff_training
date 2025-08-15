@@ -4,7 +4,7 @@ import argparse
 import random
 import torch
 from torch.utils.data import DataLoader, SubsetRandomSampler
-
+from ConfigDropout import ConfigDropout
 from model import resnet18, efficientnet_b0
 from model_zoo import ModelZoo
 from data import (
@@ -16,8 +16,6 @@ from selective_gradient import TrainRevision
 from test import test_model
 from longtail_train import train_baseline_longtail, train_with_revision_longtail
 from SimpleSwitcher import SimpleSwitcher
-
-# ⬇️ import the GA module (so we can tweak its knobs if we want)
 import GeneticRevision as GA
 
 
@@ -52,8 +50,7 @@ def main():
         "train_with_revision", "train_with_samples", "train_with_revision_3d",
         "train_with_random", "train_with_inv_lin", "train_with_log",
         "train_with_percentage", "train_with_power_law", "train_with_exponential",
-        "train_with_sigmoid_complement", "train_with_switching", "train_with_genetic"
-    ], required=True)
+        "train_with_sigmoid_complement", "train_with_switching", "train_with_genetic", "train_with_configurable"], required=True)
     parser.add_argument("--epoch", type=int, default=10)
     parser.add_argument("--task", type=str, required=True, default="classification")
     parser.add_argument("--model", type=str, choices=[
@@ -295,6 +292,23 @@ def main():
             )
             trained_model, num_step = ga.train_with_genetic()
             print("Number of steps:", num_step)
+        
+        elif args.mode == "train_with_configurable":
+            cd = ConfigDropout(
+                args.model,                # display name tag
+                model,                     # nn.Module
+                train_loader,              # full TRAIN (dropout happens inside)
+                test_loader,               # TEST (held-out)
+                device,
+                args.epoch,
+                args.save_path,
+                args.threshold,
+                seed=args.seed
+            )
+            print("Training with configurable decay+noise schedule…")
+            trained_model, num_step = cd.train_with_configurable()
+            print("Number of steps : ", num_step)
+
 
         else:
             raise ValueError(f"Unknown mode: {args.mode}")
