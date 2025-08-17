@@ -12,3 +12,10 @@ slurm-*.out
 data/
 cifar10_results/
 tune_config/drop_runs/
+slurm-*.out
+*.out
+*.pth
+*.tar.gz
+data/
+cifar10_results/
+tune_config/drop_runs/
