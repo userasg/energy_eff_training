@@ -1,470 +1,346 @@
-# GeneticRevision.py — GA random-dropout with equal partitions, 2dp math (except share%), and 0.1-step params
-import math, random, time
+# GeneticRevision.py
+# GA over batch-local dropout schedules (few knobs; self-adaptive ES mutation).
+# Now with per-epoch batch report + homogeneity %. Plug-compatible with your main.py.
+
+import math, random
+from dataclasses import dataclass
+from typing import List, Tuple, Dict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader, SubsetRandomSampler
-from tqdm import tqdm
-from utils import plot_accuracy_time_multi, plot_accuracy_time_multi_test
+from torch.utils.data import DataLoader
 
-# ----------------------------- few knobs (trimmed) -----------------------------
-POP_SIZE            = 16
-KEEP_FLOOR          = 0.4
-WARMUP_EPOCHS       = 1
-MAX_DECAY_PER_E     = 0.25
-LR                  = 2e-4
+try:
+    from tqdm import tqdm
+except Exception:
+    tqdm = None
 
-ELITE_FRAC          = 0.20
-MUT_RATE_BASE       = 0.50
-MUT_STD             = 0.40
-REPLACE_START       = 0.45
-REPLACE_END         = 0.85
-EXPLOIT_FRAC        = 0.75
-CLONE_ELITE_PROB    = 0.50
+# ------------------------------------------------------------------
+# Minimal knobs / global defaults (main.py can override KEEP_FLOOR)
+# ------------------------------------------------------------------
+LR = 3e-4
+FINAL_REVISION = False            # if True, last epoch trains with keep=1.00 for every batch
+KEEP_FLOOR = 0.35                 # main.py may set GA.KEEP_FLOOR = args.threshold
 
-SELECTION_STRATEGY  = "tournament"    # "roulette" or "tournament"
-TOURNAMENT_K        = 3
+# Engineering grid / clamps
+PARAM_STEP = 0.10
+BETA_CLAMP_NEGEXP   = (0.10, 6.00)
+BETA_CLAMP_INVPOWER = (0.10, 4.00)
+NOISE_LVL_CLAMP     = (0.00, 0.50)
 
-# fitness blend (kept internal): more weight on accuracy
-_W_ACC, _W_LOSS, _W_EFF = 0.75, 0.15, 0.10
+# Init ranges (one-time sampling, not tuned per run)
+BETA_INIT_NEGEXP    = (0.50, 3.00)
+BETA_INIT_INVPOWER  = (0.50, 2.00)
+FLOOR_INIT_RANGE    = (0.30, 0.70)    # actual lower bound uses max(KEEP_FLOOR, FLOOR_INIT_RANGE[0])
+NOISE_LVL_INIT      = (0.00, 0.30)
 
-# ----- alpha/gamma ranges + step quantization -----
-PARAM_STEP          = 0.10
-ALPHA_INIT_RANGE     = (0.70, 1.30)
-GAMMA_INIT_RANGE     = (0.90, 1.40)
-ALPHA_CLAMP          = (0.10, 3.00)
-GAMMA_CLAMP          = (0.50, 2.50)
+# ES self-adaptation constants (n strategy params = 3: sigma_beta, sigma_floor, sigma_noise)
+N_STRAT    = 3
+TAU_GLOBAL = 1.0 / (2.0 * N_STRAT) ** 0.5           # τ' = 1/sqrt(2n)
+TAU_LOCAL  = 1.0 / (2.0 * (N_STRAT ** 0.5)) ** 0.5  # τ  = 1/sqrt(2*sqrt(n))
 
-# =========================== tiny schedule object ===========================
-class ChromosomeSchedule:
-    """
-    kind ∈ {"power","invlog"}
-    alpha: shape  ∈ [0.10, 5.00], snapped to 0.10 steps (2dp)
-    gamma: sharp  ∈ [0.10, 5.00], snapped to 0.10 steps (2dp)
-    share: display-only fraction (exact from partition; NOT forced to 2dp)
-    """
-    @staticmethod
-    def _snap_grid(x: float, lo: float, hi: float, step: float) -> float:
-        # clamp, then snap to the nearest step; keep 2dp representation
-        x = max(lo, min(hi, float(x)))
-        q = round(x / step) * step
-        return float(round(max(lo, min(hi, q)), 2))
+# ---------------- utilities ----------------
+def _snap(x: float, lo: float, hi: float, step: float = PARAM_STEP) -> float:
+    x = float(max(lo, min(hi, x)))
+    q = round(x / step) * step
+    return float(round(max(lo, min(hi, q)), 2))
 
-    def __init__(self, kind, alpha, gamma, share):
-        self.kind  = kind
-        self.alpha = ChromosomeSchedule._snap_grid(alpha, ALPHA_CLAMP[0], ALPHA_CLAMP[1], PARAM_STEP)
-        self.gamma = ChromosomeSchedule._snap_grid(gamma, GAMMA_CLAMP[0], GAMMA_CLAMP[1], PARAM_STEP)
-        self.share = float(share)  # exact proportion from partition (can be non-2dp)
+def _law_value(law: str, beta: float, t: float) -> float:
+    # t in [0,1]
+    t = float(max(0.0, min(1.0, t)))
+    if law == "negexp":
+        # f(t) = exp(-beta * t)
+        return math.exp(-beta * t)
+    # law == "invpower": f(t) = (1+t)^(-beta)
+    return (1.0 + t) ** (-beta)
 
-    def _raw(self, e: int) -> float:
-        e = max(1, int(e))
-        if self.kind == "power":
-            return 1.0 / (e ** self.alpha)
-        else:  # "invlog" : log arg > 1.0 since e>=1 and alpha>=0.1 → e+alpha>=1.1
-            return 1.0 / math.log(e + self.alpha)
+@dataclass
+class Chromosome:
+    # phenotypic genes
+    law: str                     # "negexp" or "invpower"
+    beta: float                  # >= 0.1 (snapped & clamped)
+    noise_type: str              # "none" | "gaussian" | "uniform"
+    noise_level: float           # [0, 0.5]
+    keep_floor: float            # [KEEP_FLOOR, 0.95]
 
-    def keep_frac(self, e: int, keep_floor: float) -> float:
-        """
-        keep(1)=1.00, monotone → keep_floor:
-        keep_e = keep_floor + (1-keep_floor) * (r(e)/r(1))**gamma
-        """
-        r1 = self._raw(1)
-        re = self._raw(e)
-        ratio = 0.0 if r1 <= 0 else (re / r1)
-        keep = keep_floor + (1.0 - keep_floor) * (ratio ** self.gamma)
-        return float(round(min(1.0, max(keep_floor, keep)), 2))
+    # strategy (self-adaptive step sizes)
+    sigma_beta: float
+    sigma_floor: float
+    sigma_noise: float
 
-    def drop_frac(self, e: int, keep_floor: float) -> float:
-        return float(round(1.0 - self.keep_frac(e, keep_floor), 2))
+    # per-epoch schedule → keep fraction (2dp)
+    def keep_fraction(self, epoch_idx: int, total_epochs: int, rng: random.Random) -> float:
+        if total_epochs <= 1:
+            base = 1.0
+        else:
+            t = epoch_idx / float(max(1, total_epochs - 1))
+            base = _law_value(self.law, self.beta, t)
+        # map base∈(0,1] → [floor, 1]
+        keep = self.keep_floor + (1.0 - self.keep_floor) * base
 
+        # optional noise
+        if self.noise_type == "gaussian" and self.noise_level > 0.0:
+            keep += rng.gauss(0.0, self.noise_level)
+        elif self.noise_type == "uniform" and self.noise_level > 0.0:
+            keep += rng.uniform(-self.noise_level, self.noise_level)
 
-# =========================== data partition helper ===========================
-class _IndexedView(torch.utils.data.Dataset):
-    def __init__(self, base): self.base = base
-    def __len__(self): return len(self.base)
-    def __getitem__(self, i):
-        x, y = self.base[i]
-        return x, y, i
+        keep = max(self.keep_floor, min(1.0, keep))
+        return float(round(keep, 2))
 
-class DataPartitions:
-    """Disjoint fixed partitions + monotone random shrinking per chromosome."""
-    def __init__(self, base_loader, population, rng):
-        self.base_loader = base_loader
-        self.population  = population
-        self._rng        = rng
-        self._build()
+# ------------- GA primitives -------------
+def _init_chrom(rng: random.Random) -> Chromosome:
+    law = "negexp" if rng.random() < 0.5 else "invpower"
+    if law == "negexp":
+        beta = _snap(rng.uniform(*BETA_INIT_NEGEXP), *BETA_CLAMP_NEGEXP)
+    else:
+        beta = _snap(rng.uniform(*BETA_INIT_INVPOWER), *BETA_CLAMP_INVPOWER)
 
-    def _build(self):
-        ds = self.base_loader.dataset
-        N  = len(ds)
-        idx = list(range(N))
-        self._rng.shuffle(idx)
+    noise_type = ["none", "gaussian", "uniform"][rng.randrange(3)]
+    noise_level = _snap(rng.uniform(*NOISE_LVL_INIT), *NOISE_LVL_CLAMP)
 
-        # exact equal integer split (difference ≤ 1) — fairness > 2dp rule here
-        sizes = self._equal_split(N, POP_SIZE)
+    # floor lower bound honors global KEEP_FLOOR
+    floor_lo = max(KEEP_FLOOR, FLOOR_INIT_RANGE[0])
+    keep_floor = _snap(rng.uniform(floor_lo, FLOOR_INIT_RANGE[1]), KEEP_FLOOR, 0.95)
 
-        self.owner = {}         # dataset index -> chrom_id
-        self.orig  = []         # list[int] per chromosome
-        self.active= []         # active subset per chromosome (shrinks)
-        start = 0
-        for ci, sz in enumerate(sizes):
-            seg = idx[start:start+sz]; start += sz
-            for j in seg: self.owner[j] = ci
-            self.orig.append(seg)
-            self.active.append(list(seg))
-            # set display share from actual partition size (exact ratio; NOT forced to 2dp)
-            self.population[ci].share = sz / float(N)
+    # start with modest step sizes (snapped)
+    sig_beta  = _snap(0.10, 0.01, 1.00)
+    sig_floor = _snap(0.05, 0.01, 0.50)
+    sig_noise = _snap(0.05, 0.00, 0.50)
+    return Chromosome(law, beta, noise_type, noise_level, keep_floor, sig_beta, sig_floor, sig_noise)
 
-        # cache loader kwargs
-        bl = self.base_loader
-        self._loader_kw = dict(
-            batch_size=getattr(bl, "batch_size", 128),
-            num_workers=getattr(bl, "num_workers", 0),
-            pin_memory=getattr(bl, "pin_memory", False),
-            drop_last=getattr(bl, "drop_last", False),
-            collate_fn=getattr(bl, "collate_fn", None),
-        )
+def _recombine(a: Chromosome, b: Chromosome, rng: random.Random) -> Chromosome:
+    # discrete genes: coin-flip
+    law = a.law if rng.random() < 0.5 else b.law
+    noise_type = a.noise_type if rng.random() < 0.5 else b.noise_type
+    # continuous: arithmetic mean; step sizes: geometric mean
+    beta  = (a.beta + b.beta) / 2.0
+    floor = (a.keep_floor + b.keep_floor) / 2.0
+    nlvl  = (a.noise_level + b.noise_level) / 2.0
+    sb = (a.sigma_beta  * b.sigma_beta ) ** 0.5
+    sf = (a.sigma_floor * b.sigma_floor) ** 0.5
+    sn = (a.sigma_noise * b.sigma_noise) ** 0.5
 
-    @staticmethod
-    def _equal_split(N, k):
-        base = N // k
-        sizes = [base] * k
-        for i in range(N - base * k):  # first remainder partitions get +1
-            sizes[i] += 1
-        return sizes
+    # clamp/snap
+    if law == "negexp":
+        beta = _snap(beta, *BETA_CLAMP_NEGEXP)
+    else:
+        beta = _snap(beta, *BETA_CLAMP_INVPOWER)
+    floor = _snap(floor, KEEP_FLOOR, 0.95)
+    nlvl  = _snap(nlvl,  *NOISE_LVL_CLAMP)
+    sb = _snap(sb, 0.01, 1.00)
+    sf = _snap(sf, 0.01, 0.50)
+    sn = _snap(sn, 0.00, 0.50)
 
-    def make_epoch_loader(self, union_indices):
-        base = _IndexedView(self.base_loader.dataset)
-        kw = {k: v for k, v in self._loader_kw.items() if v is not None}
-        return DataLoader(base, sampler=SubsetRandomSampler(union_indices), shuffle=False, **kw)
+    return Chromosome(law, beta, noise_type, nlvl, floor, sb, sf, sn)
 
-    def update_actives(self, epoch, keep_floor, warmup_epochs, max_decay_per_e, schedules):
-        """
-        Warmup: 100% keep; afterward smooth decay:
-        keep_rel_new = min(last, max(schedule_keep, last*(1 - MAX_DECAY_PER_E))).
-        Returns {chrom_id: newly_dropped_this_epoch}
-        """
-        dropped = {}
-        for ci, chrom in enumerate(schedules):
-            last_keep = len(self.active[ci]) / max(1, len(self.orig[ci]))
-            if epoch <= warmup_epochs:
-                target_keep_rel = 1.00
-            else:
-                e_sched = epoch - warmup_epochs + 1
-                sched_keep = chrom.keep_frac(e_sched, keep_floor)
-                lower_bound = round(max(keep_floor, last_keep * (1.0 - max_decay_per_e)), 2)
-                target_keep_rel = min(last_keep, max(sched_keep, lower_bound))
+def _mutate_es(c: Chromosome, epoch: int, total_epochs: int, rng: random.Random) -> Chromosome:
+    # 1) self-adapt step sizes (log-normal; ES standard)
+    g = rng.gauss(0.0, 1.0)  # shared global term
+    sb = c.sigma_beta  * math.exp(TAU_GLOBAL * g + TAU_LOCAL * rng.gauss(0.0,1.0))
+    sf = c.sigma_floor * math.exp(TAU_GLOBAL * g + TAU_LOCAL * rng.gauss(0.0,1.0))
+    sn = c.sigma_noise * math.exp(TAU_GLOBAL * g + TAU_LOCAL * rng.gauss(0.0,1.0))
+    sb = _snap(sb, 0.01, 1.00)
+    sf = _snap(sf, 0.01, 0.50)
+    sn = _snap(sn, 0.00, 0.50)
 
-            target_count = max(1, int(round(target_keep_rel * len(self.orig[ci]))))
-            cur = self.active[ci]
-            if len(cur) > target_count:
-                self._rng.shuffle(cur)
-                self.active[ci] = cur[:target_count]
-                dropped[ci] = len(cur) - target_count
-            else:
-                dropped[ci] = 0
-        return dropped
+    # 2) mutate object-level parameters using (possibly) new step sizes
+    beta  = c.beta        + sb * rng.gauss(0.0, 1.0)
+    floor = c.keep_floor  + sf * rng.gauss(0.0, 1.0)
+    nlvl  = c.noise_level + sn * rng.gauss(0.0, 1.0)
 
-    def union_indices(self):
-        return [i for seg in self.active for i in seg]
+    if c.law == "negexp":
+        beta = _snap(beta, *BETA_CLAMP_NEGEXP)
+    else:
+        beta = _snap(beta, *BETA_CLAMP_INVPOWER)
+    floor = _snap(floor, KEEP_FLOOR, 0.95)
+    nlvl  = _snap(nlvl,  *NOISE_LVL_CLAMP)
 
+    # 3) annealed flips for discrete genes (simple heuristic)
+    p_flip = 1.0 / (1.0 + float(epoch))
+    law = c.law if rng.random() > p_flip else ("invpower" if c.law == "negexp" else "negexp")
+    noise_type = c.noise_type if rng.random() > p_flip else ["none", "gaussian", "uniform"][rng.randrange(3)]
 
-# ============================== metrics helper ==============================
-class Metrics:
-    def __init__(self, pop_size): self.reset(pop_size)
-    def reset(self, pop_size):
-        self.loss_sum = {i: 0.0 for i in range(pop_size)}
-        self.correct  = {i: 0   for i in range(pop_size)}
-        self.count    = {i: 0   for i in range(pop_size)}
-        self.kept_ep  = {i: 0   for i in range(pop_size)}
+    return Chromosome(law, beta, noise_type, nlvl, floor, sb, sf, sn)
 
-    def add_batch(self, idxs, loss_each, corr_vec, owner_map):
-        for r in range(len(idxs)):
-            ci = owner_map[int(idxs[r])]
-            self.count[ci]   += 1
-            self.kept_ep[ci] += 1
-            self.loss_sum[ci] += round(float(loss_each[r]), 2)  # 2dp here
-            self.correct[ci]  += int(corr_vec[r])
-
-    def per_chrom_means(self):
-        means = []
-        for i in range(len(self.count)):
-            c = max(1, self.count[i])
-            ce = round(self.loss_sum[i]/c, 2)
-            acc = round(self.correct[i]/c, 2)
-            means.append((ce, acc))
-        return means
-
-    def fitness(self, _weights_ignored):
-        n = len(self.count)
-        losses = [round(self.loss_sum[i] / max(1, self.count[i]), 2) for i in range(n)]
-        accs   = [round(self.correct[i]  / max(1, self.count[i]), 2) for i in range(n)]
-        kept   = [float(self.kept_ep[i]) for i in range(n)]
-
-        def _minmax(xs):
-            lo, hi = min(xs), max(xs)
-            if round(hi - lo, 2) == 0.00:
-                return [0.50 for _ in xs]
-            return [round((x - lo) / (hi - lo), 2) for x in xs]
-
-        inv = lambda xs: [round(1.0 - v, 2) for v in _minmax(xs)]
-        acc_s, loss_s, eff_s = _minmax(accs), inv(losses), inv(kept)
-        return [round(_W_ACC*acc_s[i] + _W_LOSS*loss_s[i] + _W_EFF*eff_s[i], 2) for i in range(n)]
-
-
-# ============================== the trainer (GA) ==============================
+# ---------------- main trainer ----------------
 class GeneticRevision:
     """
-    - Partition train set once into POP_SIZE equal slices (fixed owners).
-    - Each epoch: random-drop within each slice to hit a schedule (power or invlog),
-      with warmup and per-epoch smoothness cap.
-    - GA evolves (kind, alpha, gamma) snapped to 0.10 steps; population homogenises late.
-    - Evaluates: TRAIN (online), VALIDATION (per epoch), TEST (final).
+    Batch-local GA dropout:
+      - One chromosome per batch.
+      - For epoch e, that batch keeps 'keep_fraction(e)' of its items (randomly) → trains on the kept subset only.
+      - Fitness for a chromosome = that batch's mean CE loss.
+      - Replacement: keep best half of parents; replace the rest with children (elitism + steady state).
+    Works with main.py (expects val_loader and test_loader).
+    Returns (model, total_samples_backpropped).
     """
-    def __init__(self, model_name, model, train_loader, val_loader, test_loader,
-                 device, epochs, save_path=None, seed=42):
-        self.model_name = model_name
-        self.model      = model
-        self.device     = device
-        self.epochs     = int(epochs)
-        self.save_path  = save_path
-        self.train_loader = train_loader
-        self.val_loader   = val_loader
-        self.test_loader  = test_loader
+    def __init__(self, model_name, model,
+                 train_loader: DataLoader,
+                 val_loader: DataLoader,
+                 test_loader: DataLoader,
+                 device, epochs: int,
+                 save_path=None, seed: int = 42):
+        self.model_name  = model_name
+        self.model       = model
+        self.train_loader= train_loader
+        self.val_loader  = val_loader
+        self.test_loader = test_loader
+        self.device      = device
+        self.epochs      = int(epochs)
+        self.save_path   = save_path
 
         self.rng = random.Random(seed)
-        random.seed(seed); torch.manual_seed(seed)
+        torch.manual_seed(seed)
 
-        # initialise schedules (alpha/gamma from widened ranges; snapped to 0.10 grid)
-        self.population = []
-        for _ in range(POP_SIZE):
-            kind  = "power" if self.rng.random() < 0.5 else "invlog"
-            alpha = ChromosomeSchedule._snap_grid(
-                self.rng.uniform(*ALPHA_INIT_RANGE), ALPHA_CLAMP[0], ALPHA_CLAMP[1], PARAM_STEP
+        # One chromosome per *training batch*
+        self.num_batches = len(train_loader)
+        self.pop: List[Chromosome] = [_init_chrom(self.rng) for _ in range(self.num_batches)]
+
+    @torch.no_grad()
+    def _eval_loss_acc(self, loader: DataLoader) -> Tuple[float, float]:
+        self.model.eval()
+        crit = nn.CrossEntropyLoss(reduction="sum")
+        ce_sum, correct, total = 0.0, 0, 0
+        for xb, yb in loader:
+            xb, yb = xb.to(self.device), yb.to(self.device)
+            out = self.model(xb)
+            ce_sum += crit(out, yb).item()
+            correct += (out.argmax(1) == yb).sum().item()
+            total += yb.numel()
+        self.model.train()
+        loss = 0.0 if total == 0 else ce_sum / total
+        acc  = 0.0 if total == 0 else correct / total
+        return round(loss, 4), round(acc, 4)
+
+    @staticmethod
+    def _drop_batch(xb: torch.Tensor, yb: torch.Tensor, keep_frac: float):
+        n = yb.size(0)
+        k = max(1, int(round(keep_frac * n)))
+        if k >= n:  # nothing to drop
+            return xb, yb
+        idx = torch.randperm(n, device=yb.device)[:k]
+        return xb.index_select(0, idx), yb.index_select(0, idx)
+
+    # --------- reporting helpers (added) ---------
+    def _homogeneity_pct(self, rows: List[Dict]) -> float:
+        # bucket by (law, beta, floor, noise_type, noise_level) rounded to 2dp
+        buckets: Dict[Tuple, int] = {}
+        for r in rows:
+            key = (
+                r["law"],
+                round(r["beta"], 2),
+                round(r["floor"], 2),
+                r["noise_type"],
+                round(r["noise_level"], 2),
             )
-            gamma = ChromosomeSchedule._snap_grid(
-                self.rng.uniform(*GAMMA_INIT_RANGE), GAMMA_CLAMP[0], GAMMA_CLAMP[1], PARAM_STEP
+            buckets[key] = buckets.get(key, 0) + 1
+        if not buckets:
+            return 0.0
+        maj = max(buckets.values())
+        return round(100.0 * maj / max(1, len(rows)), 2)
+
+    def _print_epoch_report(self, epoch: int, rows: List[Dict], val_loss: float, val_acc: float):
+        homo = self._homogeneity_pct(rows)
+        kept_total = sum(r["kept"] for r in rows)
+        print(f"\n=== Epoch {epoch} Report ===  val: loss={val_loss:.4f} acc={val_acc:.4f}")
+        print(f"Samples Kept (for backprop): {kept_total} | Homogeneity: {homo:.2f}%")
+
+        header = (
+            " bidx | law      | beta  | floor | noise(type, lvl) | keep  | n_batch | kept | dropped | fitness "
+        )
+        print(header); print("-" * len(header))
+        for r in rows:
+            print(
+                f" {r['bidx']:4d} | {r['law']:<8s} | {r['beta']:5.2f} | {r['floor']:5.2f} | "
+                f"{r['noise_type']:<7s},{r['noise_level']:>4.2f} | {r['keep']:5.2f} | "
+                f"{r['n']:7d} | {r['kept']:4d} | {r['drop']:7d} | {r['fitness']:7.4f}"
             )
-            self.population.append(ChromosomeSchedule(kind, alpha, gamma, 1.0/POP_SIZE))
+        print("=" * len(header))
 
-        # partitions over the *train* dataset (sets exact shares per partition)
-        self.parts = DataPartitions(self.train_loader, self.population, self.rng)
-        self._epoch = 0
-
-    # ------------------------------- public entry -------------------------------
     def train_with_genetic(self):
         dev = self.device
         self.model.to(dev)
         opt = optim.AdamW(self.model.parameters(), lr=LR)
-        lr_sched = ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=3)
+        ce = nn.CrossEntropyLoss(reduction="mean")
 
-        train_acc_hist, val_acc_hist, times, samples_used = [], [], [], []
-        total_steps = 0
+        total_samples_bp = 0
 
-        for epoch in range(1, self.epochs+1):
-            self._epoch = epoch
-            t0 = time.time()
+        for epoch in range(1, self.epochs + 1):
+            # -------- Train over batches; collect fitness per batch --------
+            fitness = [None] * self.num_batches  # CE loss per batch (lower is better)
+            epoch_rows: List[Dict] = []          # rows for reporting
 
-            dropped_epoch = self.parts.update_actives(
-                epoch, KEEP_FLOOR, WARMUP_EPOCHS, MAX_DECAY_PER_E, self.population
-            )
+            iterator = enumerate(self.train_loader)
+            if tqdm is not None:
+                iterator = tqdm(enumerate(self.train_loader), total=self.num_batches,
+                                desc=f"[Batch-GA] Epoch {epoch}/{self.epochs}", leave=False, dynamic_ncols=True)
 
-            union_idx = self.parts.union_indices()
-            epoch_loader = self.parts.make_epoch_loader(union_idx)
-
-            # -------- train one epoch --------
             self.model.train()
-            M = Metrics(len(self.population))
-            seen, corr_total, loss_sum_total = 0, 0, 0.0
+            for bidx, (xb, yb) in iterator:
+                chrom = self.pop[bidx]
+                keep = 1.0 if (FINAL_REVISION and epoch == self.epochs) \
+                        else chrom.keep_fraction(epoch - 1, self.epochs, self.rng)
 
-            for x, y, idxs in tqdm(epoch_loader, desc=f"[GA] Epoch {epoch}/{self.epochs}", leave=False):
-                x, y = x.to(dev), y.to(dev)
-                logits = self.model(x)
-                loss_each = F.cross_entropy(logits, y, reduction="none")
-                loss = loss_each.mean()
+                xb = xb.to(dev, non_blocking=True)
+                yb = yb.to(dev, non_blocking=True)
+
+                n = int(yb.size(0))
+                xb_k, yb_k = self._drop_batch(xb, yb, keep)
+                k = int(yb_k.size(0))
+
+                out = self.model(xb_k)
+                loss = ce(out, yb_k)
 
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
                 opt.step()
 
-                preds = logits.argmax(1)
-                correct_vec = (preds == y).to(torch.int)
+                fit = float(round(loss.item(), 4))
+                fitness[bidx] = fit
+                total_samples_bp += k
 
-                bs = y.size(0)
-                seen += bs
-                corr_total += int(correct_vec.sum().item())
-                loss_sum_total += round(float(loss_each.sum().detach().cpu()), 2)
+                # collect report row
+                epoch_rows.append({
+                    "bidx": bidx,
+                    "law": chrom.law,
+                    "beta": float(round(chrom.beta, 2)),
+                    "floor": float(round(chrom.keep_floor, 2)),
+                    "noise_type": chrom.noise_type,
+                    "noise_level": float(round(chrom.noise_level, 2)),
+                    "keep": float(round(keep, 2)),
+                    "n": n,
+                    "kept": k,
+                    "drop": n - k,
+                    "fitness": fit,
+                })
 
-                M.add_batch(idxs, loss_each.detach().cpu().tolist(),
-                            correct_vec.detach().cpu().tolist(), self.parts.owner)
+                if tqdm is not None:
+                    iterator.set_postfix(keep=f"{keep:.2f}", loss=f"{loss.item():.4f}")
 
-            train_loss = round(loss_sum_total / max(1, seen), 2)
-            train_acc  = round(corr_total / max(1, seen), 2)
-            train_acc_hist.append(train_acc)
-            samples_used.append(seen)
-            total_steps += seen
-
-            # -------- validation --------
+            # -------- Validation (full-batch, no dropout) --------
             val_loss, val_acc = self._eval_loss_acc(self.val_loader)
-            lr_sched.step(val_loss)
-            val_acc_hist.append(val_acc)
 
-            # -------- GA update --------
-            fitness = M.fitness((_W_ACC, _W_LOSS, _W_EFF))
-            self._evolve(fitness)
+            # -------- (μ+λ) selection with elitism (no extra passes) --------
+            children: List[Chromosome] = []
+            for _ in range(self.num_batches):
+                i = self.rng.randrange(self.num_batches)
+                j = self.rng.randrange(self.num_batches)
+                child = _recombine(self.pop[i], self.pop[j], self.rng)
+                child = _mutate_es(child, epoch, self.epochs, self.rng)
+                children.append(child)
 
-            # -------- report --------
-            self._print_epoch_report(
-                epoch=epoch,
-                train_loss=train_loss,
-                train_acc=train_acc,
-                val_loss=val_loss,
-                val_acc=val_acc,
-                kept_total=seen,
-                dropped_epoch=dropped_epoch,
-                fitness=fitness,
-                per_means=M.per_chrom_means()
-            )
+            order = sorted(range(self.num_batches), key=lambda i: fitness[i])
+            survivors_idx = order[: self.num_batches // 2]                # best half (parents)
+            survivors = [self.pop[i] for i in survivors_idx]
+            inject = children[: self.num_batches - len(survivors)]        # fill with children
+            self.pop = survivors + inject
 
-            times.append(time.time() - t0)
+            # -------- Epoch report (NEW) --------
+            self._print_epoch_report(epoch, epoch_rows, val_loss, val_acc)
 
-        # -------- final TEST --------
+        # -------- Final test --------
         test_loss, test_acc = self._eval_loss_acc(self.test_loader)
-        print(f"\n=== Final TEST ===  Loss: {test_loss:.2f} | Acc: {test_acc:.2f}\n")
+        print(f"\n=== FINAL TEST ===  loss={test_loss:.4f} acc={test_acc:.4f}")
 
-        plot_accuracy_time_multi(self.model_name + "_genetic_train", train_acc_hist, times,
-                                 self.save_path, self.save_path)
-        plot_accuracy_time_multi_test(self.model_name + "_genetic_val", val_acc_hist, times, samples_used,
-                                      KEEP_FLOOR, self.save_path, self.save_path)
-
-        return self.model, total_steps
-
-    # --------------------------- evolution internals ---------------------------
-    def _current_mut_rate(self):
-        frac_left = max(0.0, 1.0 - self._epoch / max(1, self.epochs))
-        return round(max(0.05, MUT_RATE_BASE * (0.5 + 0.5 * frac_left)), 2)
-
-    def _evolve(self, fitness):
-        pop = self.population
-        m = len(pop)
-        frac_done = self._epoch / max(1, self.epochs)
-        repl_rate = REPLACE_START + (REPLACE_END - REPLACE_START) * frac_done
-        g = max(2, int(math.ceil(repl_rate * m)))
-
-        order = sorted(range(m), key=lambda i: fitness[i], reverse=True)
-        elite_n = max(1, int(round(ELITE_FRAC * m)))
-        elites = [pop[i] for i in order[:elite_n]]
-
-        children = []
-        for _ in range(g):
-            if frac_done >= EXPLOIT_FRAC and self.rng.random() < CLONE_ELITE_PROB:
-                base = elites[0]
-                child = ChromosomeSchedule(base.kind, base.alpha, base.gamma, 0.0)
-                child = self._mutate(child, tiny=True)
-            else:
-                p1 = pop[self._select_parent(fitness)]
-                p2 = pop[self._select_parent(fitness)]
-                child = self._mutate(self._crossover(p1, p2))
-            children.append(child)
-
-        survivors = [pop[i] for i in order[elite_n:]]
-        survivors = survivors[:-g] if g < len(survivors) else []
-
-        new_pop = elites + survivors + children
-        if len(new_pop) > m: new_pop = new_pop[:m]
-        while len(new_pop) < m: new_pop.append(self._mutate(self.rng.choice(elites)))
-
-        # keep display shares aligned with existing ones
-        for i in range(m): new_pop[i].share = pop[i].share
-        self.population = new_pop
-
-    def _select_parent(self, fitness):
-        if SELECTION_STRATEGY == "tournament":
-            k = max(2, TOURNAMENT_K)
-            cand = self.rng.sample(range(len(fitness)), k=k)
-            return max(cand, key=lambda i: fitness[i])
-        # roulette
-        base = min(fitness)
-        shifted = [round(f - base, 2) for f in fitness]
-        total = sum(shifted)
-        if total <= 0: return self.rng.randrange(len(fitness))
-        r, c = self.rng.random() * total, 0.0
-        for i, f in enumerate(shifted):
-            c += f
-            if r <= c: return i
-        return len(fitness) - 1
-
-    def _crossover(self, a, b):
-        kind  = a.kind if self.rng.random() < 0.5 else b.kind
-        w1, w2 = self.rng.random(), self.rng.random()
-        alpha  = w1 * a.alpha + (1.0 - w1) * b.alpha
-        gamma  = w2 * a.gamma + (1.0 - w2) * b.gamma
-        # snap to grid + clamp + 2dp
-        alpha  = ChromosomeSchedule._snap_grid(alpha, ALPHA_CLAMP[0], ALPHA_CLAMP[1], PARAM_STEP)
-        gamma  = ChromosomeSchedule._snap_grid(gamma, GAMMA_CLAMP[0], GAMMA_CLAMP[1], PARAM_STEP)
-        return ChromosomeSchedule(kind, alpha, gamma, 0.0)
-
-    def _mutate(self, c, tiny=False):
-        out = ChromosomeSchedule(c.kind, c.alpha, c.gamma, 0.0)
-        mut = self._current_mut_rate() * (0.25 if tiny else 1.0)
-        if self.rng.random() < round(mut * 0.25, 2):
-            out.kind = "power" if c.kind == "invlog" else "invlog"
-        if self.rng.random() < mut:
-            a = out.alpha + self.rng.gauss(0.0, MUT_STD * (0.5 if tiny else 1.0))
-            out.alpha = ChromosomeSchedule._snap_grid(a, ALPHA_CLAMP[0], ALPHA_CLAMP[1], PARAM_STEP)
-        if self.rng.random() < mut:
-            g = out.gamma + self.rng.gauss(0.0, MUT_STD * (0.5 if tiny else 1.0))
-            out.gamma = ChromosomeSchedule._snap_grid(g, GAMMA_CLAMP[0], GAMMA_CLAMP[1], PARAM_STEP)
-        return out
-
-    # ------------------------------- evaluation -------------------------------
-    @torch.no_grad()
-    def _eval_loss_acc(self, loader):
-        self.model.eval()
-        total, correct, loss_sum = 0, 0, 0.0
-        crit = nn.CrossEntropyLoss(reduction="sum")
-        for batch in loader:
-            if not isinstance(batch, (list, tuple)) or len(batch) < 2: continue
-            x, y = batch[:2]
-            x, y = x.to(self.device), y.to(self.device)
-            logits = self.model(x)
-            loss_sum += crit(logits, y).item()
-            pred = logits.argmax(1)
-            correct += (pred == y).sum().item()
-            total   += y.numel()
-        mean_loss = 0.0 if total == 0 else round(loss_sum / total, 2)
-        acc = 0.0 if total == 0 else round(correct / total, 2)
-        self.model.train()
-        return mean_loss, acc
-
-    # ------------------------------- reporting --------------------------------
-    def _print_epoch_report(self, epoch, train_loss, train_acc, val_loss, val_acc,
-                            kept_total, dropped_epoch, fitness, per_means):
-        # homogeneity
-        buckets = {}
-        for c in self.population:
-            key = (c.kind, round(c.alpha, 2), round(c.gamma, 2))
-            buckets[key] = buckets.get(key, 0) + 1
-        majority = max(buckets, key=lambda k: buckets[k])
-        homo_pct = round(100.0 * buckets[majority] / len(self.population), 2)
-
-        total_N = sum(len(seg) for seg in self.parts.orig)  # exact share denominator
-
-        print(f"\n=== Epoch {epoch} Report ===")
-        print(f"Train Loss: {train_loss:.2f} | Train Acc: {train_acc:.2f}")
-        print(f" Val  Loss: {val_loss:.2f} |  Val  Acc: {val_acc:.2f}")
-        print(f"Samples Kept (for backprop): {kept_total}")
-        print(f"Homogeneity: {homo_pct:5.2f}%  (majority ~ {majority[0]}, alpha≈{majority[1]:.2f}, gamma≈{majority[2]:.2f})")
-
-        header = " idx | kind   | share% | alpha  | gamma  | drop(e) | kept_ep | dropped | mean_CE | train_acc | fitness "
-        print(header); print("-"*len(header))
-        for i, c in enumerate(self.population):
-            share_pct = 100.0 * len(self.parts.orig[i]) / max(1, total_N)  # exact ratio; not forced to 2dp globally
-            drop_e = c.drop_frac(max(1, epoch - WARMUP_EPOCHS + 1), KEEP_FLOOR) if epoch > 1 else 0.00
-            mean_ce, mean_tracc = per_means[i]
-            print(f" {i:3d} | {c.kind:6s} | {share_pct:6.2f} | {c.alpha:6.2f} | {c.gamma:6.2f} | "
-                  f"{drop_e:7.2f} | {self.parts.active[i].__len__():7d} | {dropped_epoch.get(i,0):7d} | "
-                  f"{mean_ce:7.2f} | {mean_tracc:9.2f} | {fitness[i]:7.2f}")
-        print("="*len(header))
+        return self.model, total_samples_bp

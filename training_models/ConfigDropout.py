@@ -1,7 +1,7 @@
 # ConfigDropout.py
 # configurable random dropout over epochs using decay laws + optional noise
 # plugs into main as: --mode train_with_configurable
-
+import os
 import time, math
 import numpy as np
 import torch
@@ -16,21 +16,35 @@ try:
 except Exception:
     tqdm = None
 
+
 # ============================
 # HYPERPARAMS (edit & go)
 # ============================
 DECAY_FUNCTION   = "negexp"     # ["negexp", "invpower"]
-BETA             = 3.0          # for negexp: f(t)=exp(-BETA*t)
-POWER_BETA       = 5.0          # for invpower: f(t)=(1+t)^(-POWER_BETA)
-MIN_KEEP_RATIO   = 0.40        # floor on kept fraction (destination)
+BETA             = 8.5          # for negexp: f(t)=exp(-BETA*t)
+POWER_BETA       = 0.0          # for invpower: f(t)=(1+t)^(-POWER_BETA)
+MIN_KEEP_RATIO   = 0.45        # floor on kept fraction (destination)
 FINAL_REVISION   = True         # train on full dataset at last epoch
 
-NOISE_TYPE       = "gaussian"       # ["none","gaussian","uniform","saltpepper"]
-NOISE_LEVEL      = 0.05       # std/amplitude; if 0 => no noise
+NOISE_TYPE       = "none"       # ["none","gaussian","uniform","saltpepper"]
+NOISE_LEVEL      = 0.00      # std/amplitude; if 0 => no noise
 NOISE_PROB       = 0.00         # used by saltpepper
 
 VAL_FRAC         = 0.10         # carve from TRAIN once for validation
-SEED             = 123          # rng seed for subset + noise
+SEED             = 42          # rng seed for subset + noise
+
+def _as_bool(v): return str(v).lower() in ("1", "true", "t", "yes", "y")
+
+DECAY_FUNCTION = os.getenv("CD_DECAY_FUNCTION", DECAY_FUNCTION)
+BETA           = float(os.getenv("CD_BETA", BETA))
+POWER_BETA     = float(os.getenv("CD_POWER_BETA", POWER_BETA))
+MIN_KEEP_RATIO = float(os.getenv("CD_MIN_KEEP_RATIO", MIN_KEEP_RATIO))
+FINAL_REVISION = _as_bool(os.getenv("CD_FINAL_REVISION", FINAL_REVISION))
+NOISE_TYPE     = os.getenv("CD_NOISE_TYPE", NOISE_TYPE)
+NOISE_LEVEL    = float(os.getenv("CD_NOISE_LEVEL", NOISE_LEVEL))
+NOISE_PROB     = float(os.getenv("CD_NOISE_PROB", NOISE_PROB))
+VAL_FRAC       = float(os.getenv("CD_VAL_FRAC", VAL_FRAC))
+SEED           = int(os.getenv("CD_SEED", SEED))
 
 # ============================
 # Trainer
@@ -79,9 +93,9 @@ class ConfigDropout(TrainRevision):
     def _base_frac(self, epoch):
         if self.epochs <= 1: return 1.0
         t = epoch / (self.epochs - 1)
-        if DECAY_FUNCTION.lower() in ["negexp", "negative_exponential", "exp"]:
+        if DECAY_FUNCTION.lower() in ["negexp", "exp"]:
             f = self._negexp(t)
-        elif DECAY_FUNCTION.lower() in ["invpower", "inverse_power", "power"]:
+        elif DECAY_FUNCTION.lower() in ["invpower", "power"]:
             f = self._invpower(t)
         else:
             raise ValueError(f"unknown DECAY_FUNCTION: {DECAY_FUNCTION}")

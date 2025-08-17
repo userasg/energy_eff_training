@@ -1,0 +1,36 @@
+Using device: cpu
+11.8
+⚠️ CUDA not available. Using CPU.
+Files already downloaded and verified
+Files already downloaded and verified
+Training with configurable decay+noise schedule…
+[schedule] decay=invpower | BETA=0.0 POWER_BETA=2.4110535042865755 | min_keep=0.5359065463975176 final_revision=False | noise=uniform level=0.11875875571239969 p=0.0 | val_frac=0.1293342379629357
+
+epoch 1/1:   0%|          | 0/1361 [00:00<?, ?it/s]
+epoch 1/1:   0%|          | 0/1361 [00:01<?, ?it/s, acc=0.156, loss=2.2773]
+epoch 1/1:   0%|          | 1/1361 [00:01<29:01,  1.28s/it, acc=0.156, loss=2.2773]
+epoch 1/1:   0%|          | 1/1361 [00:02<29:01,  1.28s/it, acc=0.219, loss=2.3522]
+epoch 1/1:   0%|          | 2/1361 [00:02<24:19,  1.07s/it, acc=0.219, loss=2.3522]
+epoch 1/1:   0%|          | 2/1361 [00:03<24:19,  1.07s/it, acc=0.125, loss=2.2999]
+epoch 1/1:   0%|          | 3/1361 [00:03<22:29,  1.01it/s, acc=0.125, loss=2.2999]
+epoch 1/1:   0%|          | 3/1361 [00:04<22:29,  1.01it/s, acc=0.031, loss=2.3567]
+epoch 1/1:   0%|          | 4/1361 [00:04<22:42,  1.00s/it, acc=0.031, loss=2.3567]
+epoch 1/1:   0%|          | 4/1361 [00:05<22:42,  1.00s/it, acc=0.031, loss=2.3604]
+epoch 1/1:   0%|          | 5/1361 [00:05<22:12,  1.02it/s, acc=0.031, loss=2.3604]
+epoch 1/1:   0%|          | 5/1361 [00:06<22:12,  1.02it/s, acc=0.062, loss=2.4567]
+epoch 1/1:   0%|          | 6/1361 [00:06<22:45,  1.01s/it, acc=0.062, loss=2.4567]
+epoch 1/1:   0%|          | 6/1361 [00:07<22:45,  1.01s/it, acc=0.188, loss=2.1808]
+epoch 1/1:   1%|          | 7/1361 [00:07<21:51,  1.03it/s, acc=0.188, loss=2.1808]
+epoch 1/1:   1%|          | 7/1361 [00:08<21:51,  1.03it/s, acc=0.156, loss=2.4227]
+epoch 1/1:   1%|          | 8/1361 [00:08<22:09,  1.02it/s, acc=0.156, loss=2.4227]
+epoch 1/1:   1%|          | 8/1361 [00:08<22:09,  1.02it/s, acc=0.094, loss=2.3666]
+epoch 1/1:   1%|          | 9/1361 [00:08<21:25,  1.05it/s, acc=0.094, loss=2.3666]
+epoch 1/1:   1%|          | 9/1361 [00:09<21:25,  1.05it/s, acc=0.062, loss=2.4274]
+epoch 1/1:   1%|          | 10/1361 [00:09<21:43,  1.04it/s, acc=0.062, loss=2.4274]
+epoch 1/1:   1%|          | 10/1361 [00:10<21:43,  1.04it/s, acc=0.219, loss=2.1535]
+epoch 1/1:   1%|          | 11/1361 [00:10<20:59,  1.07it/s, acc=0.219, loss=2.1535]
+epoch 1/1:   1%|          | 11/1361 [00:11<20:59,  1.07it/s, acc=0.094, loss=2.1842]
+epoch 1/1:   1%|          | 12/1361 [00:11<20:15,  1.11it/s, acc=0.094, loss=2.1842]
+epoch 1/1:   1%|          | 12/1361 [00:12<20:15,  1.11it/s, acc=0.125, loss=2.2930]
+epoch 1/1:   1%|          | 13/1361 [00:12<21:01,  1.07it/s, acc=0.125, loss=2.2930]
+epoch 1/1:   1%|          | 13/1361 [00:13<21:01,  1.07it/s, acc=0.062, loss=2.2869]

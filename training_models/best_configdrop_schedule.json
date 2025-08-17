@@ -1,0 +1,11 @@
+{
+  "best_value": 0.8511,
+  "best_params": {
+    "DECAY_FUNCTION": "invpower",
+    "POWER_BETA": 0.8591815805962993,
+    "MIN_KEEP_RATIO": 0.8875316756288786,
+    "FINAL_REVISION": false,
+    "NOISE_TYPE": "none",
+    "VAL_FRAC": 0.1180786019777067
+  }
+}
