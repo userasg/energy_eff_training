@@ -1,6 +1,7 @@
 # ConfigDropout.py
 # configurable random dropout over epochs using decay laws + optional noise
 # plugs into main as: --mode train_with_configurable
+
 import os
 import time, math
 import numpy as np
@@ -16,35 +17,41 @@ try:
 except Exception:
     tqdm = None
 
-
 # ============================
 # HYPERPARAMS (edit & go)
 # ============================
-DECAY_FUNCTION   = "negexp"     # ["negexp", "invpower"]
-BETA             = 8.5          # for negexp: f(t)=exp(-BETA*t)
-POWER_BETA       = 0.0          # for invpower: f(t)=(1+t)^(-POWER_BETA)
-MIN_KEEP_RATIO   = 0.45        # floor on kept fraction (destination)
-FINAL_REVISION   = True         # train on full dataset at last epoch
+DECAY_FUNCTION     = "negexp"     # ["negexp", "invpower"]
+BETA               = 12.5        # negexp: f(t)=exp(-BETA*t)
+POWER_BETA         = 0.0          # invpower: f(t)=(1+t)^(-POWER_BETA)
+MIN_KEEP_RATIO     = 0.45         # floor on kept fraction (destination)
+FINAL_REVISION     = True         # train on full dataset at last epoch
 
-NOISE_TYPE       = "none"       # ["none","gaussian","uniform","saltpepper"]
-NOISE_LEVEL      = 0.00      # std/amplitude; if 0 => no noise
-NOISE_PROB       = 0.00         # used by saltpepper
+NOISE_TYPE         = "gaussian"   # ["none","gaussian","uniform","saltpepper"]
+NOISE_LEVEL        = 0.02         # std/amplitude; if 0 => no noise
+NOISE_PROB         = 0.00         # used by saltpepper
 
-VAL_FRAC         = 0.10         # carve from TRAIN once for validation
-SEED             = 42          # rng seed for subset + noise
+VAL_FRAC           = 0.00         # carve from TRAIN once for validation
+SEED               = 42           # rng seed for subset + noise
+
+# NEW: subset formation mode
+# - True  => progressive/nested: fix a permutation once; each epoch takes a prefix (carry-over).
+# - False => resample: draw a fresh random subset each epoch (original behavior).
+PROGRESSIVE_PREFIX = False
 
 def _as_bool(v): return str(v).lower() in ("1", "true", "t", "yes", "y")
 
-DECAY_FUNCTION = os.getenv("CD_DECAY_FUNCTION", DECAY_FUNCTION)
-BETA           = float(os.getenv("CD_BETA", BETA))
-POWER_BETA     = float(os.getenv("CD_POWER_BETA", POWER_BETA))
-MIN_KEEP_RATIO = float(os.getenv("CD_MIN_KEEP_RATIO", MIN_KEEP_RATIO))
-FINAL_REVISION = _as_bool(os.getenv("CD_FINAL_REVISION", FINAL_REVISION))
-NOISE_TYPE     = os.getenv("CD_NOISE_TYPE", NOISE_TYPE)
-NOISE_LEVEL    = float(os.getenv("CD_NOISE_LEVEL", NOISE_LEVEL))
-NOISE_PROB     = float(os.getenv("CD_NOISE_PROB", NOISE_PROB))
-VAL_FRAC       = float(os.getenv("CD_VAL_FRAC", VAL_FRAC))
-SEED           = int(os.getenv("CD_SEED", SEED))
+# env overrides
+DECAY_FUNCTION     = os.getenv("CD_DECAY_FUNCTION", DECAY_FUNCTION)
+BETA               = float(os.getenv("CD_BETA", BETA))
+POWER_BETA         = float(os.getenv("CD_POWER_BETA", POWER_BETA))
+MIN_KEEP_RATIO     = float(os.getenv("CD_MIN_KEEP_RATIO", MIN_KEEP_RATIO))
+FINAL_REVISION     = _as_bool(os.getenv("CD_FINAL_REVISION", FINAL_REVISION))
+NOISE_TYPE         = os.getenv("CD_NOISE_TYPE", NOISE_TYPE)
+NOISE_LEVEL        = float(os.getenv("CD_NOISE_LEVEL", NOISE_LEVEL))
+NOISE_PROB         = float(os.getenv("CD_NOISE_PROB", NOISE_PROB))
+VAL_FRAC           = float(os.getenv("CD_VAL_FRAC", VAL_FRAC))
+SEED               = int(os.getenv("CD_SEED", SEED))
+PROGRESSIVE_PREFIX = _as_bool(os.getenv("CD_PROGRESSIVE_PREFIX", PROGRESSIVE_PREFIX))
 
 # ============================
 # Trainer
@@ -62,6 +69,12 @@ class ConfigDropout(TrainRevision):
         self.data_size  = len(self.train_dataset)
         self.batch_size = getattr(train_loader, "batch_size", 32)
         self.num_workers = getattr(train_loader, "num_workers", 2)
+
+        # --- for progressive / nested subsets ---
+        self.progressive = bool(PROGRESSIVE_PREFIX)
+        if self.progressive:
+            self.perm = self.rng.permutation(self.data_size)  # fixed permutation
+            self._prev_n_keep = self.data_size                # track last prefix length
 
     # ---------- tiny split ----------
     def _prepare_val_split(self, train_loader, val_frac, seed):
@@ -86,7 +99,6 @@ class ConfigDropout(TrainRevision):
     # ---------- decay laws ----------
     def _negexp(self, t):         # t∈[0,1]
         return math.exp(-BETA * t)
-
     def _invpower(self, t):       # f(0)=1, monotone ↓
         return (1.0 + t) ** (-POWER_BETA)
 
@@ -115,24 +127,38 @@ class ConfigDropout(TrainRevision):
         return x
 
     def _keep_fraction(self, epoch):
-      # base from the schedule (for logging)
-      base = self._base_frac(epoch)
-
-      # final epoch: force full revision BUT still return (keep, base)
-      if FINAL_REVISION and epoch == self.epochs - 1:
-          keep = 1.0
-          return keep, base
-
-      # otherwise: schedule (+ optional noise) → clipped
-      keep = self._apply_noise(base, epoch)
-      keep = float(np.clip(keep, MIN_KEEP_RATIO, 1.0))
-      return keep, base
-
+        """Return (keep_req, base). Epoch 0 and final epoch (if enabled) request full data."""
+        base = self._base_frac(epoch)
+        if epoch == 0:
+            return 1.0, base
+        if FINAL_REVISION and epoch == self.epochs - 1:
+            return 1.0, base
+        keep = self._apply_noise(base, epoch)
+        keep = float(np.clip(keep, MIN_KEEP_RATIO, 1.0))
+        return keep, base
 
     # ---------- per-epoch subset loader ----------
-    def _epoch_loader(self, frac):
-        n_keep = max(1, int(round(frac * self.data_size)))
-        idx = self.rng.permutation(self.data_size)[:n_keep].tolist()
+    def _epoch_loader(self, frac, *, force_full=False):
+        """Build DataLoader for current epoch.
+        force_full=True overrides the progressive prefix rule and re-expands to all data.
+        """
+        if force_full:
+            n_keep = self.data_size
+            if self.progressive:
+                idx = self.perm.tolist()  # use entire fixed order
+                self._prev_n_keep = self.data_size
+            else:
+                idx = self.rng.permutation(self.data_size).tolist()
+        else:
+            n_target = max(1, int(round(frac * self.data_size)))
+            if self.progressive:
+                n_keep = min(n_target, self._prev_n_keep)
+                idx = self.perm[:n_keep].tolist()
+                self._prev_n_keep = n_keep
+            else:
+                n_keep = n_target
+                idx = self.rng.permutation(self.data_size)[:n_keep].tolist()
+
         subset = Subset(self.train_dataset, idx)
         return DataLoader(
             subset,
@@ -167,25 +193,28 @@ class ConfigDropout(TrainRevision):
         ce  = nn.CrossEntropyLoss()
         opt = optim.AdamW(self.model.parameters(), lr=3e-4)
 
+        subset_mode = "progressive-prefix" if self.progressive else "resample-each-epoch"
         print(
             f"[schedule] decay={DECAY_FUNCTION}"
             f" | BETA={BETA} POWER_BETA={POWER_BETA}"
             f" | min_keep={MIN_KEEP_RATIO} final_revision={FINAL_REVISION}"
             f" | noise={NOISE_TYPE} level={NOISE_LEVEL} p={NOISE_PROB}"
             f" | val_frac={VAL_FRAC}"
+            f" | subset_mode={subset_mode}"
         )
 
         start_time = time.time()
         epoch_train_acc, epoch_test_acc = [], []
         time_per_epoch, samples_used_per_epoch = [], []
-        total_samples_bp = 0  # <-- return to main for EE
+        total_samples_bp = 0
 
         for epoch in range(self.epochs):
-            keep, base = self._keep_fraction(epoch)
-            loader, n_keep = self._epoch_loader(keep)
+            keep_req, base = self._keep_fraction(epoch)
+            force_full = FINAL_REVISION and (epoch == self.epochs - 1)
+            loader, n_keep = self._epoch_loader(keep_req, force_full=force_full)
             samples_used_per_epoch.append(n_keep)
 
-            # --- train epoch (with progress bar + it/s) ---
+            # --- train epoch ---
             self.model.train()
             t0 = time.time()
             running_loss, running_acc, running_n = 0.0, 0.0, 0
@@ -194,7 +223,6 @@ class ConfigDropout(TrainRevision):
             if tqdm is not None:
                 iterator = tqdm(loader, leave=False, dynamic_ncols=True, desc=f"epoch {epoch+1}/{self.epochs}")
 
-            iters = 0
             for xb, yb in iterator:
                 xb = xb.to(self.device, non_blocking=True)
                 yb = yb.to(self.device, non_blocking=True)
@@ -211,15 +239,12 @@ class ConfigDropout(TrainRevision):
                 running_loss += loss.item() * bsz
                 running_acc  += acc * bsz
                 running_n    += bsz
-                total_samples_bp += bsz   # <-- count samples (not batches) for EE
-                iters += 1
+                total_samples_bp += bsz
 
                 if tqdm is not None:
                     iterator.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.3f}")
 
             epoch_time = time.time() - t0
-            ips = iters / max(1e-9, epoch_time)
-
             train_loss = running_loss / max(1, running_n)
             train_acc  = running_acc  / max(1, running_n)
             epoch_train_acc.append(train_acc)
@@ -228,21 +253,15 @@ class ConfigDropout(TrainRevision):
             val_loss,  val_acc  = self._eval_once(self.val_loader)
             test_loss, test_acc = self._eval_once(self.test_loader)
             epoch_test_acc.append(test_acc)
-
             time_per_epoch.append(epoch_time)
 
-            # print compact epoch summary (no running EE)
-            if self.epochs > 1:
-                t_norm = epoch / (self.epochs - 1)
-            else:
-                t_norm = 0.0
+            t_norm = 0.0 if self.epochs <= 1 else epoch / (self.epochs - 1)
             print(
                 f"[{epoch+1}/{self.epochs}] "
-                f"t={t_norm:.3f} base_keep={base:.3f} keep={keep:.3f} n={n_keep} | "
+                f"t={t_norm:.3f} base_keep={base:.3f} keep_req={keep_req:.3f} n={n_keep} | "
                 f"train: loss={train_loss:.4f} acc={train_acc:.4f} | "
                 f"val: loss={val_loss:.4f} acc={val_acc:.4f} | "
-                f"test: loss={test_loss:.4f} acc={test_acc:.4f} | "
-                f"{ips:.1f} it/s"
+                f"test: loss={test_loss:.4f} acc={test_acc:.4f}"
             )
 
         end_time = time.time()

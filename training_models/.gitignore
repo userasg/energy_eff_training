@@ -1,2 +1,4 @@
-training_models/data/cifar-10-python.tar.gz
-training_models/slurm-1063724.out
+/data/cifar-10-python.tar.gz
+slurm-1063724.out
+/cifar10_results/mobilenet_v2_optuna
+/tune_configdrop_runs
