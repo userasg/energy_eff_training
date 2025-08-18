@@ -1,6 +1,6 @@
 # ConfigDropout.py
-# configurable random dropout over epochs using decay laws + optional noise
-# plugs into main as: --mode train_with_configurable
+# Configurable random dropout over epochs using decay laws + optional noise
+# Plugs into main as: --mode train_with_configurable
 
 import os
 import time, math
@@ -20,30 +20,28 @@ except Exception:
 # ============================
 # HYPERPARAMS (edit & go)
 # ============================
-DECAY_FUNCTION     = "negexp"     # ["negexp", "invpower"]
-BETA               = 12.5        # negexp: f(t)=exp(-BETA*t)
-POWER_BETA         = 0.0          # invpower: f(t)=(1+t)^(-POWER_BETA)
+DECAY_FUNCTION     = "invpower"     # ["negexp", "invpower"]
+BETA               = 12.5         # negexp: f(t)=exp(-BETA*t); invpower: f(t)=(1+t)^(-BETA)
 MIN_KEEP_RATIO     = 0.45         # floor on kept fraction (destination)
-FINAL_REVISION     = True         # train on full dataset at last epoch
+FINAL_REVISION     = False         # train on full dataset at last epoch
 
-NOISE_TYPE         = "gaussian"   # ["none","gaussian","uniform","saltpepper"]
-NOISE_LEVEL        = 0.02         # std/amplitude; if 0 => no noise
-NOISE_PROB         = 0.00         # used by saltpepper
+NOISE_TYPE         = "uniform"   # ["none","gaussian","uniform","saltpepper"]
+NOISE_LEVEL        = 0.05        # std/amplitude; if 0 => no noise
+NOISE_PROB         = 0.00         # used by "saltpepper"
 
-VAL_FRAC           = 0.00         # carve from TRAIN once for validation
+VAL_FRAC           = 0.05         # carve from TRAIN once for validation
 SEED               = 42           # rng seed for subset + noise
 
-# NEW: subset formation mode
+# Subset formation mode
 # - True  => progressive/nested: fix a permutation once; each epoch takes a prefix (carry-over).
 # - False => resample: draw a fresh random subset each epoch (original behavior).
 PROGRESSIVE_PREFIX = False
 
 def _as_bool(v): return str(v).lower() in ("1", "true", "t", "yes", "y")
 
-# env overrides
+# ---------- env overrides (used by tuner / CLI runs) ----------
 DECAY_FUNCTION     = os.getenv("CD_DECAY_FUNCTION", DECAY_FUNCTION)
 BETA               = float(os.getenv("CD_BETA", BETA))
-POWER_BETA         = float(os.getenv("CD_POWER_BETA", POWER_BETA))
 MIN_KEEP_RATIO     = float(os.getenv("CD_MIN_KEEP_RATIO", MIN_KEEP_RATIO))
 FINAL_REVISION     = _as_bool(os.getenv("CD_FINAL_REVISION", FINAL_REVISION))
 NOISE_TYPE         = os.getenv("CD_NOISE_TYPE", NOISE_TYPE)
@@ -70,7 +68,7 @@ class ConfigDropout(TrainRevision):
         self.batch_size = getattr(train_loader, "batch_size", 32)
         self.num_workers = getattr(train_loader, "num_workers", 2)
 
-        # --- for progressive / nested subsets ---
+        # progressive / nested subsets (carry-over)
         self.progressive = bool(PROGRESSIVE_PREFIX)
         if self.progressive:
             self.perm = self.rng.permutation(self.data_size)  # fixed permutation
@@ -96,14 +94,16 @@ class ConfigDropout(TrainRevision):
         )
         return train_subset, val_loader
 
-    # ---------- decay laws ----------
+    # ---------- decay laws (both use the single BETA) ----------
     def _negexp(self, t):         # t∈[0,1]
         return math.exp(-BETA * t)
+
     def _invpower(self, t):       # f(0)=1, monotone ↓
-        return (1.0 + t) ** (-POWER_BETA)
+        return (1.0 + t) ** (-BETA)
 
     def _base_frac(self, epoch):
-        if self.epochs <= 1: return 1.0
+        if self.epochs <= 1:
+            return 1.0
         t = epoch / (self.epochs - 1)
         if DECAY_FUNCTION.lower() in ["negexp", "exp"]:
             f = self._negexp(t)
@@ -116,7 +116,8 @@ class ConfigDropout(TrainRevision):
 
     # ---------- noise ----------
     def _apply_noise(self, x, epoch):
-        if NOISE_TYPE == "none" or NOISE_LEVEL == 0.0: return x
+        if NOISE_TYPE == "none" or NOISE_LEVEL == 0.0:
+            return x
         r = np.random.default_rng(self.seed + 7919 * epoch)
         if NOISE_TYPE == "gaussian":
             return x + r.normal(0.0, NOISE_LEVEL)
@@ -139,13 +140,13 @@ class ConfigDropout(TrainRevision):
 
     # ---------- per-epoch subset loader ----------
     def _epoch_loader(self, frac, *, force_full=False):
-        """Build DataLoader for current epoch.
-        force_full=True overrides the progressive prefix rule and re-expands to all data.
+        """Build DataLoader for the current epoch.
+        force_full=True overrides progressive prefix and re-expands to all data.
         """
         if force_full:
             n_keep = self.data_size
             if self.progressive:
-                idx = self.perm.tolist()  # use entire fixed order
+                idx = self.perm.tolist()
                 self._prev_n_keep = self.data_size
             else:
                 idx = self.rng.permutation(self.data_size).tolist()
@@ -196,7 +197,7 @@ class ConfigDropout(TrainRevision):
         subset_mode = "progressive-prefix" if self.progressive else "resample-each-epoch"
         print(
             f"[schedule] decay={DECAY_FUNCTION}"
-            f" | BETA={BETA} POWER_BETA={POWER_BETA}"
+            f" | BETA={BETA}"
             f" | min_keep={MIN_KEEP_RATIO} final_revision={FINAL_REVISION}"
             f" | noise={NOISE_TYPE} level={NOISE_LEVEL} p={NOISE_PROB}"
             f" | val_frac={VAL_FRAC}"

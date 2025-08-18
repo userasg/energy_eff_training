@@ -6,8 +6,5 @@
 
 source /usr2/share/gpu.sbatch
 
-python optuna_tune_configdropout.py \
-  --study configdrop-mbv2-c10 \
-  --storage sqlite:///optuna_studies/configdrop.db \
-  --n-trials 20 \
-  --target-acc 0.90
+CD_EARLY_STOP_ACC=0.90
+python optuna_tune_configdropout.py --n-trials 10 --epochs 30 --target-acc 0.90

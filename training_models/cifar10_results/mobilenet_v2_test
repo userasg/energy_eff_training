@@ -305,10 +305,10 @@
     },
     "mobilenet_v2_0.3_config_train": {
         "cumulative_time": [
-            122.42415189743042
+            131.59845066070557
         ],
         "accuracy": [
-            0.554
+            0.576
         ]
     }
 }
