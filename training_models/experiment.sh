@@ -7,11 +7,11 @@
 source /usr2/share/gpu.sbatch
 
 python ./main.py \
-  --model mobilenet_v2 \
+  --model efficientnet_b0 \
   --mode train_with_configurable \
-  --epoch 30 \
-  --save_path cifar10_results/mobilenet_v2 \
-  --dataset cifar10 \
+  --epoch 200 \
+  --save_path cifar_results/efficientnet_b0 \
+  --dataset cifar \
   --batch_size 32 \
   --start_revision 0 \
   --task classification \

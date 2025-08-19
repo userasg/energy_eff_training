@@ -1,8 +1,8 @@
 {
-  "best_value": 0.5953,
+  "best_value": 0.8531,
   "best_params": {
     "DECAY_FUNCTION": "invpower",
-    "BETA": 9.5,
-    "NOISE_LEVEL": 0.11
+    "BETA": 0.5,
+    "NOISE_LEVEL": 0.13
   }
 }
