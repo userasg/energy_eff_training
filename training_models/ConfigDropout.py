@@ -28,11 +28,11 @@ BETA           = 3.0          # shared aggressiveness/steepness
 MIN_KEEP_RATIO = 0.10         # floor on kept fraction (destination)
 
 # Spike pattern: 0=no spikes, 1=final 100%, 2=+mid 50%, 3=+quarter 25%
-SPIKE          = 3
+SPIKE          = 2
 
 # noise (no salt & pepper)
-NOISE_TYPE     = "none"   # ["none","gaussian","uniform"]
-NOISE_LEVEL    = 0.00         # std/amplitude; if 0 => no noise
+NOISE_TYPE     = "gaussian"       # ["none","gaussian","uniform"]
+NOISE_LEVEL    = 0.01         # std/amplitude; if 0 => no noise
 
 VAL_FRAC       = 0.00         # carve from TRAIN once for validation
 SEED           = 42           # rng seed for schedules/noise
@@ -51,7 +51,7 @@ SEED           = int(os.getenv("CD_SEED", SEED))
 # helpers
 # ============================
 class _IndexedSubset(Dataset):
-    """Wrap a Subset to also return the original dataset index."""
+    """Wrap a Subset to also return the original dataset index (for overlap debug)."""
     def __init__(self, subset: Subset):
         assert isinstance(subset, Subset)
         self.subset = subset
@@ -90,21 +90,20 @@ class ConfigDropout(TrainRevision):
         v = int(N * float(val_frac))
         val_idx, train_idx = idx[:v].tolist(), idx[v:].tolist()
 
-        train_subset = Subset(ds, train_idx)
-        # Wrap training so we can read original indices for debug/overlap
-        train_indexed = _IndexedSubset(train_subset)
+        train_subset   = Subset(ds, train_idx)
+        train_indexed  = _IndexedSubset(train_subset)  # include original indices for debug overlap
 
         val_subset   = Subset(ds, val_idx)
         val_loader = DataLoader(
             val_subset,
-            batch_size=self.batch_size if hasattr(self, "batch_size") else getattr(train_loader, "batch_size", 32),
+            batch_size=getattr(train_loader, "batch_size", 32),
             shuffle=False,
             num_workers=getattr(train_loader, "num_workers", 2),
             pin_memory=True,
         )
         return train_indexed, val_loader
 
-    # ---------- decay laws (use shared BETA, t in [0,1]) ----------
+    # ---------- decay laws (share BETA, t in [0,1]) ----------
     def _negexp(self, t):    # e^{-β t}
         return math.exp(-BETA * t)
 
@@ -112,17 +111,11 @@ class ConfigDropout(TrainRevision):
         return (1.0 + t) ** (-BETA)
 
     def _linear(self, t):
-        """
-        Linear decay until cutoff; larger β => faster drop (time scaled).
-        f(t) = 1 - min(1, β * t)
-        """
+        # Linear to zero; β scales time (β>1 drops faster).
         return max(0.0, 1.0 - min(1.0, BETA * t))
 
     def _step(self, t):
-        """
-        Simple stepped decay (3 steps). β controls the height of later steps.
-        thresholds: 1/3, 2/3.
-        """
+        # Simple 3-step decay; β shapes step heights.
         if t < 1.0/3.0:
             return 1.0
         elif t < 2.0/3.0:
@@ -131,20 +124,15 @@ class ConfigDropout(TrainRevision):
             return (1.0/3.0) ** max(0.0, BETA)
 
     def _logistic(self, t):
-        """
-        Reversed cumulative logistic: decays from ~1 to ~0.
-        β controls steepness (bigger β -> steeper).
-        f(t) = 1 / (1 + exp((t - 0.5)/s)),  s = 0.25 / max(1, β)
-        """
-        s = 0.25 / max(1.0, BETA)
+        # Reversed cumulative logistic from ~1 to ~0; β controls steepness.
+        s = 0.25 / max(1.0, BETA)  # smaller s -> steeper
         return 1.0 / (1.0 + math.exp((t - 0.5) / max(1e-8, s)))
 
     def _base_frac(self, epoch):
-        """Return un-noised keep fraction r(t) in [MIN_KEEP_RATIO, 1]."""
+        """Return r(t) in [MIN_KEEP_RATIO, 1] before noise/spikes."""
         if self.epochs <= 1:
             return 1.0
-        # normalize epoch to t ∈ [0,1]
-        t = epoch / (self.epochs - 1)
+        t = epoch / (self.epochs - 1)  # normalize to [0,1]
 
         fsel = DECAY_FUNCTION.lower()
         if fsel in ("negexp", "exp"):
@@ -160,7 +148,6 @@ class ConfigDropout(TrainRevision):
         else:
             raise ValueError(f"unknown DECAY_FUNCTION: {DECAY_FUNCTION}")
 
-        # map f∈[0,1] -> [MIN_KEEP_RATIO, 1]
         f = max(0.0, min(1.0, f))
         return float(MIN_KEEP_RATIO + (1.0 - MIN_KEEP_RATIO) * f)
 
@@ -177,7 +164,7 @@ class ConfigDropout(TrainRevision):
         if SPIKE >= 2 and epoch == mid:
             return 0.5
         if SPIKE >= 3 and epoch == qtr:
-            return 0.25
+            return 0.75
         return None
 
     # ---------- noise ----------
@@ -205,13 +192,12 @@ class ConfigDropout(TrainRevision):
 
         spike = self._spike_override(epoch)
         if spike is not None:
-            keep = spike  # exact revision amount
+            keep = spike
 
         return keep, base
 
-    # ---------- loader (full dataset; per-batch dropout happens inside loop) ----------
+    # ---------- loader over full dataset; dropout is inside the loop ----------
     def _epoch_loader(self):
-        """Return a loader over the *full* train set (shuffled)."""
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
@@ -251,7 +237,7 @@ class ConfigDropout(TrainRevision):
             f" | min_keep={MIN_KEEP_RATIO} | spikes={SPIKE}"
             f" | noise={NOISE_TYPE} level={NOISE_LEVEL}"
             f" | val_frac={VAL_FRAC}"
-            f" | sampler=per-batch random keep k≈r·B (no mask forward pass)"
+            f" | sampler=per-item Bernoulli keep p=r(t) (no forward-pass mask)"
         )
 
         start_time = time.time()
@@ -269,7 +255,7 @@ class ConfigDropout(TrainRevision):
             loader = self._epoch_loader()
             used_indices = set()  # indices actually trained on this epoch
 
-            # --- train epoch (pure random dropout inside each batch) ---
+            # --- train epoch (pure random dropout: Bernoulli per item) ---
             self.model.train()
             t0 = time.time()
             running_loss, running_acc, running_n = 0.0, 0.0, 0
@@ -284,16 +270,19 @@ class ConfigDropout(TrainRevision):
                 yb = yb.to(self.device, non_blocking=True)
 
                 B = yb.size(0)
-                r = 1.0 if force_full else float(np.clip(keep_req, MIN_KEEP_RATIO, 1.0))
-                k = max(1, int(round(r * B)))
+                p = 1.0 if force_full else float(np.clip(keep_req, MIN_KEEP_RATIO, 1.0))
 
-                # ---- PURE RANDOM DROPOUT (no mask forward pass) ----
-                idx = torch.randperm(B, device=xb.device)[:k]
-                xb_sel = xb.index_select(0, idx)
-                yb_sel = yb.index_select(0, idx)
+                # ---- PURE RANDOM DROPOUT (no model forward mask) ----
+                # Bernoulli keep per item. Avoid empty batch by forcing 1 if needed.
+                keep_mask = (torch.rand(B, device=xb.device) < p)
+                if not keep_mask.any():
+                    # ensure at least one sample
+                    rand_idx = torch.randint(0, B, (1,), device=xb.device)
+                    keep_mask[rand_idx] = True
 
-                # track which dataset items were actually used
-                ib_sel = torch.as_tensor(ib, device=idx.device)[idx].tolist()
+                xb_sel = xb[keep_mask]
+                yb_sel = yb[keep_mask]
+                ib_sel = torch.as_tensor(ib, device=xb.device)[keep_mask].tolist()
                 used_indices.update(ib_sel)
 
                 out = self.model(xb_sel)
@@ -303,6 +292,7 @@ class ConfigDropout(TrainRevision):
                 loss.backward()
                 opt.step()
 
+                k = yb_sel.size(0)
                 acc = (out.argmax(1) == yb_sel).float().mean().item()
                 running_loss += loss.item() * k
                 running_acc  += acc * k
@@ -311,7 +301,7 @@ class ConfigDropout(TrainRevision):
                 total_samples_bp += k
 
                 if tqdm is not None:
-                    iterator.set_postfix(loss=f"{loss.item():.4f}", kept=k)
+                    iterator.set_postfix(loss=f"{loss.item():.4f}", kept=int(k))
 
             epoch_time = time.time() - t0
             train_loss = running_loss / max(1, running_n)
@@ -372,7 +362,7 @@ class ConfigDropout(TrainRevision):
             plt.hist(overlaps, bins=10)
             plt.xlabel("Overlap with previous epoch (%)")
             plt.ylabel("Count")
-            plt.title("Per-epoch sample overlap (pure per-batch random dropout)")
+            plt.title("Per-epoch sample overlap (pure per-item random dropout)")
             out_path = os.path.join(self.save_path, "sampler_overlap_hist.png")
             plt.tight_layout(); plt.savefig(out_path); plt.close()
             print(f"Overlap histogram saved to: {out_path}")
